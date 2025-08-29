@@ -6,6 +6,11 @@ const SQRT3 = Math.sqrt(3);
 let HEX_SIZE = 10; // pixel radius of hex (computed at init to fit canvas)
 let ORIGIN_X = 0, ORIGIN_Y = 0; // render offset to center the map
 
+// Vision / Range constants
+const VISION_CARRIER = 4;     // 敵味方空母の視界
+const VISION_SQUADRON = 5;    // 敵味方航空機の視界
+const SQUADRON_RANGE = 22;    // 航空機の航続距離（空母からの最大距離）
+
 // === State ===
 const SQUAD_MAX_HP = 40;
 const CARRIER_MAX_HP = 100;
@@ -13,8 +18,8 @@ const state = {
   map: [], // 0=sea, 1=island
   turn: 1,
   mode: 'select', // select | move | launch
-  carrier: { id: 'C1', x: 3, y: 3, hp: 100, speed: 2, vision: 10, hangar: 2 },
-  enemy: { carrier: { id: 'E1', x: 26, y: 26, hp: 100, speed: 2, vision: 10, hangar: 2 }, squadrons: [] },
+  carrier: { id: 'C1', x: 3, y: 3, hp: 100, speed: 2, vision: VISION_CARRIER, hangar: 2, target: null },
+  enemy: { carrier: { id: 'E1', x: 26, y: 26, hp: 100, speed: 2, vision: VISION_CARRIER, hangar: 2 }, squadrons: [] },
   intel: { // player視点の可視・記憶
     carrier: { seen: false, x: null, y: null, ttl: 0 },
     squadrons: new Map(), // id -> {seen, x, y, ttl}
@@ -27,6 +32,8 @@ const state = {
   highlight: null,
   log: [],
   gameOver: false,
+  // 今ターンの可視セル（自軍の現在位置視界＋移動経路でスイープした視界）
+  turnVisible: new Set(), // key: "x,y"
 };
 
 // === DOM ===
@@ -55,6 +62,8 @@ function init() {
   // 初期編隊（基地待機、HPはゲーム中回復しない）
   state.squadrons = Array.from({ length: state.carrier.hangar }, (_, i) => ({ id: `SQ${i + 1}`, hp: SQUAD_MAX_HP, state: 'base' }));
   state.enemy.squadrons = Array.from({ length: state.enemy.carrier.hangar }, (_, i) => ({ id: `ESQ${i + 1}`, hp: SQUAD_MAX_HP, state: 'base' }));
+  // 初期可視範囲（自軍現在位置のみ）
+  computeTurnVisibility([]);
   renderAll();
   logMsg('作戦開始: ターン1');
   setHint();
@@ -126,9 +135,9 @@ function setMode(mode) {
 function setHint() {
   const m = state.mode;
   const text = m === 'move'
-    ? 'マップをクリックして2マス以内へ移動'
+    ? '目的地をクリック（毎ターン自動移動）'
     : m === 'launch'
-      ? '目標地点をクリックして打撃隊を出撃'
+      ? `目標地点をクリック（航続${SQUADRON_RANGE}以内）`
       : 'ユニット状況を確認できます';
   el.hint.textContent = text;
 }
@@ -163,6 +172,11 @@ function renderMap() {
       ctx.strokeStyle = getCss('--grid');
       ctx.lineWidth = 1;
       ctx.stroke();
+      // 自軍視界（今ターン）：少し明るくオーバーレイ
+      if (isTurnVisible(c, r)) {
+        ctx.fillStyle = 'rgba(255,255,255,0.14)';
+        ctx.fill();
+      }
     }
   }
 
@@ -175,7 +189,12 @@ function renderMap() {
     ctx.moveTo(poly[0][0], poly[0][1]);
     for (let i = 1; i < poly.length; i++) ctx.lineTo(poly[i][0], poly[i][1]);
     ctx.closePath();
-    ctx.strokeStyle = '#ffffff';
+    let color = '#ffffff';
+    if (state.mode === 'launch') {
+      const d = hexDistance({ x: c, y: r }, state.carrier);
+      if (d > SQUADRON_RANGE) color = '#ff5c5c';
+    }
+    ctx.strokeStyle = color;
     ctx.lineWidth = 2;
     ctx.stroke();
   }
@@ -185,6 +204,11 @@ function renderUnits() {
   // carrier
   drawRectTile(state.carrier.x, state.carrier.y, getCss('--carrier'));
   drawHpBarTile(state.carrier.x, state.carrier.y, state.carrier.hp, CARRIER_MAX_HP, '#6ad4ff');
+  if (state.carrier.target) {
+    drawLineTile(state.carrier.x, state.carrier.y, state.carrier.target.x, state.carrier.target.y, 'rgba(106,212,255,0.35)');
+  }
+
+  // launch mode: dashed range outline removed (hover color indicates validity)
 
   // squadrons
   for (const sq of state.squadrons) {
@@ -313,17 +337,41 @@ function drawLineTile(x1, y1, x2, y2, color) {
   ctx.stroke();
 }
 
+// 指定中心からhex距離=rangeのタイル中心を結んでアウトラインを描画
+function drawRangeOutline(cx, cy, range, color) {
+  const pts = [];
+  const [pcx, pcy] = offsetToPixel(cx, cy);
+  for (let y = 0; y < MAP_H; y++) {
+    for (let x = 0; x < MAP_W; x++) {
+      if (hexDistance({ x, y }, { x: cx, y: cy }) === range) {
+        const [px, py] = offsetToPixel(x, y);
+        const ang = Math.atan2(py - pcy, px - pcx);
+        pts.push({ px, py, ang });
+      }
+    }
+  }
+  if (pts.length < 6) return; // not enough to draw a ring
+  pts.sort((a, b) => a.ang - b.ang);
+  ctx.save();
+  ctx.strokeStyle = color;
+  ctx.lineWidth = 1.5;
+  ctx.setLineDash([6, 4]);
+  ctx.beginPath();
+  ctx.moveTo(pts[0].px, pts[0].py);
+  for (let i = 1; i < pts.length; i++) ctx.lineTo(pts[i].px, pts[i].py);
+  ctx.closePath();
+  ctx.stroke();
+  ctx.restore();
+}
+
 // === Panels ===
 function updatePanels() {
   const c = state.carrier;
   el.carrierStatus.innerHTML = `
     <div class="kv">
-      <div>位置</div><div class="mono">(${c.x}, ${c.y})</div>
       <div>HP</div><div>${c.hp}</div>
-      <div>視界</div><div>${c.vision}</div>
       <div>搭載枠</div><div>${c.hangar - countActiveSquadrons()} / ${c.hangar}</div>
     </div>
-    <div class="kv"><div>ターン</div><div>${state.turn}</div></div>
   `;
 
   if (state.squadrons.filter((s)=>s.state!=='lost').length === 0) {
@@ -333,8 +381,6 @@ function updatePanels() {
       return `<div class="kv">
         <div>ID</div><div class="mono">${s.id}</div>
         <div>状態</div><div>${labelSqState(s.state)}</div>
-        <div>位置</div><div class="mono">${s.state==='base'?'(CARRIER)':`(${s.x}, ${s.y})`}</div>
-        <div>目標</div><div class="mono">${s.target?`(${s.target.x}, ${s.target.y})`:'-'}</div>
         <div>HP</div><div>${s.hp ?? SQUAD_MAX_HP}</div>
       </div>`;
     }).join('');
@@ -369,20 +415,25 @@ function onMapClick(e) {
   if (!t) return;
 
   if (state.mode === 'move') {
-    tryMoveCarrier(t.x, t.y);
+    setCarrierDestination(t.x, t.y);
   } else if (state.mode === 'launch') {
     tryLaunchStrike(t.x, t.y);
   }
 }
 
-function tryMoveCarrier(x, y) {
-  if (state.map[y][x] === 1) { logMsg('島には移動できません'); return; }
-  const dist = hexDistance(state.carrier, { x, y });
-  if (dist > state.carrier.speed) { logMsg(`遠すぎます（距離${dist}）`); return; }
-  if (isOccupied(x, y, { ignore: { type: 'carrier', side: 'player' } })) { logMsg('そのマスは使用中です'); return; }
-  state.carrier.x = x;
-  state.carrier.y = y;
-  logMsg(`空母を(${x}, ${y})へ移動`);
+function setCarrierDestination(x, y) {
+  // 目的地は海に制限。島をクリックしたら最寄りの海に補正。
+  let dest = { x, y };
+  if (state.map[y][x] === 1) {
+    dest = nearestSea(x, y);
+    if (state.map[dest.y][dest.x] === 1) { logMsg('適切な海マスが見つかりません'); return; }
+  }
+  state.carrier.target = dest;
+  if (state.carrier.x === dest.x && state.carrier.y === dest.y) {
+    logMsg('空母は既に目的地に到達しています');
+  } else {
+    logMsg(`空母の目的地を(${dest.x}, ${dest.y})に設定`);
+  }
   renderAll();
 }
 
@@ -390,10 +441,12 @@ function tryLaunchStrike(tx, ty) {
   if (countBaseAvailable() <= 0) { logMsg('搭載機がありません'); return; }
   const sq = state.squadrons.find((s)=>s.state==='base' && s.hp>0);
   if (!sq) { logMsg('搭載機がありません'); return; }
+  // 航続距離チェック（空母からの距離がSQUADRON_RANGE以内）
+  if (hexDistance({ x: tx, y: ty }, state.carrier) > SQUADRON_RANGE) { logMsg(`航続距離外です（最大${SQUADRON_RANGE}）`); return; }
   // 発艦位置は空母の周囲の空きマス
   const spawn = findFreeAdjacent(state.carrier.x, state.carrier.y, { preferAwayFrom: { x: tx, y: ty } });
   if (!spawn) { logMsg('発艦スペースがありません'); return; }
-  sq.x = spawn.x; sq.y = spawn.y; sq.target = { x: tx, y: ty }; sq.state = 'outbound'; sq.speed = 10; sq.vision = 10;
+  sq.x = spawn.x; sq.y = spawn.y; sq.target = { x: tx, y: ty }; sq.state = 'outbound'; sq.speed = 10; sq.vision = VISION_SQUADRON;
   logMsg(`打撃隊${sq.id}を(${tx}, ${ty})へ出撃（発艦: ${spawn.x},${spawn.y}）`);
   renderAll();
 }
@@ -403,14 +456,37 @@ function nextTurn() {
   if (state.gameOver) return;
   state.turn += 1;
 
+  // このターンで移動した経路を収集（自軍のみ）
+  const pathSweep = [];// array of {x,y,range}
+
+  // 0) 空母の自動移動（目的地に向けて毎ターン進む。毎ターン目的地変更可）
+  if (state.carrier.target) {
+    const before = { x: state.carrier.x, y: state.carrier.y };
+    const tgt = state.carrier.target;
+    if (before.x !== tgt.x || before.y !== tgt.y) {
+      const path = [];
+      stepOnGridTowards(state.carrier, tgt, state.carrier.speed, { avoid: true, passIslands: false, trackPath: path, trackVisionRange: state.carrier.vision });
+      pathSweep.push(...path);
+      const after = { x: state.carrier.x, y: state.carrier.y };
+      if (after.x === tgt.x && after.y === tgt.y) {
+        logMsg(`空母が目的地(${tgt.x}, ${tgt.y})に到達`);
+        state.carrier.target = null;
+      } else if (after.x !== before.x || after.y !== before.y) {
+        logMsg(`空母が(${before.x}, ${before.y})→(${after.x}, ${after.y})へ前進`);
+      }
+    }
+  }
+
   // 1) 自軍編隊の行動（発見→接近→同ターン攻撃可→帰還）
   for (const sq of [...state.squadrons]) {
     const ec = state.enemy.carrier;
     if (sq.state === 'outbound') {
       // 索敵に入ったら接近。1マス以内に到達できたらこのターンで攻撃。
-      if (hexDistance(sq, ec) <= (sq.vision || 10)) {
+      if (hexDistance(sq, ec) <= (sq.vision || VISION_SQUADRON)) {
         const before = hexDistance(sq, ec);
-        stepOnGridTowards(sq, ec, sq.speed, { stopRange: 1, avoid: true, ignoreId: sq.id, passIslands: true });
+        const path = [];
+        stepOnGridTowards(sq, ec, sq.speed, { stopRange: 1, avoid: true, ignoreId: sq.id, passIslands: true, trackPath: path, trackVisionRange: (sq.vision || VISION_SQUADRON) });
+        pathSweep.push(...path);
         const after = hexDistance(sq, ec);
         if (after <= 1) {
           const dmg = scaledDamage(sq, 25);
@@ -427,20 +503,24 @@ function nextTurn() {
             sq.state = 'returning';
           }
         } else {
-          if (before > (sq.vision || 10)) {
+          if (before > (sq.vision || VISION_SQUADRON)) {
             logMsg(`${sq.id} 敵空母を発見、接近中`);
           }
           sq.state = 'engaging';
         }
       } else {
-        stepOnGridTowards(sq, sq.target, sq.speed, { avoid: true, ignoreId: sq.id, passIslands: true });
+        const path = [];
+        stepOnGridTowards(sq, sq.target, sq.speed, { avoid: true, ignoreId: sq.id, passIslands: true, trackPath: path, trackVisionRange: (sq.vision || VISION_SQUADRON) });
+        pathSweep.push(...path);
         if (sq.x === sq.target.x && sq.y === sq.target.y) {
           logMsg(`${sq.id} 目標到達、敵見当たらず 帰還`);
           sq.state = 'returning';
         }
       }
     } else if (sq.state === 'engaging') {
-      stepOnGridTowards(sq, ec, sq.speed, { stopRange: 1, avoid: true, ignoreId: sq.id, passIslands: true });
+      const path = [];
+      stepOnGridTowards(sq, ec, sq.speed, { stopRange: 1, avoid: true, ignoreId: sq.id, passIslands: true, trackPath: path, trackVisionRange: (sq.vision || VISION_SQUADRON) });
+      pathSweep.push(...path);
       if (hexDistance(sq, ec) <= 1) {
         const dmg = scaledDamage(sq, 25);
         ec.hp = Math.max(0, ec.hp - dmg);
@@ -457,7 +537,9 @@ function nextTurn() {
       }
     } else if (sq.state === 'returning') {
       // 空母と同一マスは禁止。1マス以内に入ったら帰還完了とみなす。
-      stepOnGridTowards(sq, state.carrier, sq.speed, { stopRange: 1, avoid: true, ignoreId: sq.id, passIslands: true });
+      const path = [];
+      stepOnGridTowards(sq, state.carrier, sq.speed, { stopRange: 1, avoid: true, ignoreId: sq.id, passIslands: true, trackPath: path, trackVisionRange: (sq.vision || VISION_SQUADRON) });
+      pathSweep.push(...path);
       if (hexDistance(sq, state.carrier) <= 1) {
         logMsg(`${sq.id} 帰還完了（基地待機へ）`);
         sq.state = 'base'; delete sq.x; delete sq.y; delete sq.target;
@@ -468,20 +550,26 @@ function nextTurn() {
   // 2) 敵AI：空母移動/出撃/編隊行動
   enemyTurn();
 
-  // 3) 可視情報更新（player側表示用）
+  // 3) 今ターンの可視範囲（自軍の現在位置＋移動経路スイープ）を計算
+  computeTurnVisibility(pathSweep);
+
+  // 4) 可視情報更新（player側表示用）
   updatePlayerIntel();
   renderAll();
 
-  // 4) 勝敗判定
+  // 5) 勝敗判定
   checkGameEnd();
   logMsg(`ターン${state.turn}`);
 }
 
 // === Utils ===
 function tileFromEvent(e) {
+  // Scale client coords to canvas internal coords to handle CSS/devicePixelRatio
   const rect = el.canvas.getBoundingClientRect();
-  const mx = e.clientX - rect.left;
-  const my = e.clientY - rect.top;
+  const scaleX = el.canvas.width / rect.width;
+  const scaleY = el.canvas.height / rect.height;
+  const mx = (e.clientX - rect.left) * scaleX;
+  const my = (e.clientY - rect.top) * scaleY;
   const [qf, rf] = pixelToAxial(mx, my);
   const { q, r } = axialRound(qf, rf);
   const off = axialToOffset(q, r);
@@ -497,7 +585,7 @@ function hexDistance(a, b) {
 }
 
 // グリッド上をチェビシェフ距離短縮のため1歩ずつ進める。占有マスは回避（簡易）。
-function stepOnGridTowards(obj, target, stepMax, { stopRange = 0, avoid = false, ignoreId = null, passIslands = false } = {}) {
+function stepOnGridTowards(obj, target, stepMax, { stopRange = 0, avoid = false, ignoreId = null, passIslands = false, trackPath = null, trackVisionRange = null } = {}) {
   // Prefer straight-line stepping along hex line; fallback to greedy neighbor if blocked
   for (let step = 0; step < stepMax; step++) {
     const dist = hexDistance(obj, target);
@@ -521,13 +609,16 @@ function stepOnGridTowards(obj, target, stepMax, { stopRange = 0, avoid = false,
       if (!passIslands && state.map[ny][nx] === 1) continue;
       if (avoid && isOccupied(nx, ny, { ignore: { type: 'squad', id: ignoreId } })) continue;
       if (hexDistance({ x: nx, y: ny }, target) > dist) continue;
-      obj.x = nx; obj.y = ny; moved = true; break;
+      obj.x = nx; obj.y = ny; moved = true;
+      if (trackPath) trackPath.push({ x: nx, y: ny, range: trackVisionRange ?? 0 });
+      break;
     }
     // 最後の手段: どれも距離が縮まらない場合、直線候補が安全なら距離維持で1歩進む
     if (!moved && nxt) {
       const nx = nxt.x, ny = nxt.y;
       if (nx >= 0 && ny >= 0 && nx < MAP_W && ny < MAP_H && (passIslands || state.map[ny][nx] === 0) && !(avoid && isOccupied(nx, ny, { ignore: { type: 'squad', id: ignoreId } }))) {
         obj.x = nx; obj.y = ny; moved = true;
+        if (trackPath) trackPath.push({ x: nx, y: ny, range: trackVisionRange ?? 0 });
       }
     }
     if (!moved) break;
@@ -553,6 +644,23 @@ function nextStepOnHexLine(from, to) {
   const ax = cubeToAxial(cr.x, cr.y, cr.z);
   const off = axialToOffset(ax.q, ax.r);
   return { x: off.col, y: off.row };
+}
+
+// 直線上で origin から target の方向に dist だけ進んだ地点（offset座標）を返す
+function pointAtHexLineDistance(origin, target, dist) {
+  let p = { x: origin.x, y: origin.y };
+  for (let i = 0; i < dist; i++) {
+    const n = nextStepOnHexLine(p, target);
+    if (!n) break; p = n;
+  }
+  return p;
+}
+
+// 航続距離制限を超えていれば、制限内の最近縁点へ切り詰める
+function clampTargetToRange(origin, target, maxRange) {
+  const d = hexDistance(origin, target);
+  if (d <= maxRange) return { x: target.x, y: target.y };
+  return pointAtHexLineDistance(origin, target, maxRange);
 }
 
 // 指定中心（offset座標）からhex距離r以内を海にする（島の浸食）
@@ -664,30 +772,30 @@ function findFreeAdjacent(cx, cy, { preferAwayFrom } = {}) {
 
 function isVisibleToPlayer(x, y) {
   if (hexDistance({ x, y }, state.carrier) <= state.carrier.vision) return true;
-  for (const sq of state.squadrons) if (sq.state!=='base' && sq.state!=='lost' && hexDistance({ x, y }, sq) <= (sq.vision || 10)) return true;
+  for (const sq of state.squadrons) if (sq.state!=='base' && sq.state!=='lost' && hexDistance({ x, y }, sq) <= (sq.vision || VISION_SQUADRON)) return true;
   return false;
 }
 
 function isVisibleToEnemy(x, y) {
   const ec = state.enemy.carrier;
   if (hexDistance({ x, y }, ec) <= ec.vision) return true;
-  for (const sq of state.enemy.squadrons) if (sq.state!=='base' && sq.state!=='lost' && hexDistance({ x, y }, sq) <= (sq.vision || 10)) return true;
+  for (const sq of state.enemy.squadrons) if (sq.state!=='base' && sq.state!=='lost' && hexDistance({ x, y }, sq) <= (sq.vision || VISION_SQUADRON)) return true;
   return false;
 }
 
 // === Hex helpers ===
 function computeHexMetrics() {
-  const W = el.canvas.width, H = el.canvas.height;
-  // compute HEX_SIZE to fit map into canvas
-  // pointy-top odd-r rectangle: width ~= sqrt(3)*size*(MAP_W + 0.5), height ~= 1.5*size*(MAP_H - 1) + 2*size
-  const sizeByW = W / (SQRT3 * (MAP_W + 0.5));
-  const sizeByH = H / (1.5 * (MAP_H - 1) + 2);
-  HEX_SIZE = Math.max(8, Math.floor(Math.min(sizeByW, sizeByH)));
-  // center map
+  // Choose hex size from current canvas width, then set canvas size to exact map pixel size.
+  const W0 = el.canvas.width; // initial/intrinsic width
+  const sizeByW = W0 / (SQRT3 * (MAP_W + 0.5));
+  HEX_SIZE = Math.max(5, Math.floor(sizeByW));
   const mapPixelW = SQRT3 * HEX_SIZE * (MAP_W + 0.5);
   const mapPixelH = 1.5 * HEX_SIZE * (MAP_H - 1) + 2 * HEX_SIZE;
-  ORIGIN_X = Math.round((W - mapPixelW) / 2 + HEX_SIZE);
-  ORIGIN_Y = Math.round((H - mapPixelH) / 2 + HEX_SIZE);
+  el.canvas.width = Math.ceil(mapPixelW);
+  el.canvas.height = Math.ceil(mapPixelH);
+  // Pack map near top-left with minimal margin (one hex radius)
+  ORIGIN_X = HEX_SIZE;
+  ORIGIN_Y = HEX_SIZE;
 }
 
 function offsetToPixel(col, row) {
@@ -765,11 +873,12 @@ function enemyTurn() {
   if (countActiveEnemySquadrons() < ec.hangar && state.enemy.squadrons.some((s)=>s.state==='base' && s.hp>0)) {
     if (state.enemyIntel.carrier.ttl > 0) {
       // 既知位置へ打撃出撃
-      const t = { x: state.enemyIntel.carrier.x, y: state.enemyIntel.carrier.y };
+      let t = { x: state.enemyIntel.carrier.x, y: state.enemyIntel.carrier.y };
+      t = clampTargetToRange(ec, t, SQUADRON_RANGE);
       const spawn = findFreeAdjacent(ec.x, ec.y, { preferAwayFrom: t });
       if (spawn) {
         const esq = state.enemy.squadrons.find((s)=>s.state==='base' && s.hp>0);
-        if (esq) { esq.x = spawn.x; esq.y = spawn.y; esq.target = t; esq.state = 'outbound'; esq.speed = 10; esq.vision = 10; }
+        if (esq) { esq.x = spawn.x; esq.y = spawn.y; esq.target = t; esq.state = 'outbound'; esq.speed = 10; esq.vision = VISION_SQUADRON; }
         state.enemyIntel.carrier.ttl -= 1;
         logMsg(`敵編隊が出撃した気配`);
       }
@@ -778,11 +887,12 @@ function enemyTurn() {
       const turnsSince = state.turn - state.enemyAI.lastPatrolTurn;
       if (turnsSince >= 3) {
         const wp = getEnemyPatrolWaypoint();
-        const t = nearestSea(wp.x, wp.y);
+        let t = nearestSea(wp.x, wp.y);
+        t = clampTargetToRange(ec, t, SQUADRON_RANGE);
         const spawn = findFreeAdjacent(ec.x, ec.y, { preferAwayFrom: t });
         if (spawn) {
           const esq = state.enemy.squadrons.find((s)=>s.state==='base' && s.hp>0);
-          if (esq) { esq.x = spawn.x; esq.y = spawn.y; esq.target = t; esq.state = 'outbound'; esq.speed = 10; esq.vision = 10; }
+          if (esq) { esq.x = spawn.x; esq.y = spawn.y; esq.target = t; esq.state = 'outbound'; esq.speed = 10; esq.vision = VISION_SQUADRON; }
           state.enemyAI.lastPatrolTurn = state.turn;
           logMsg(`敵編隊が索敵に出撃した気配`);
         }
@@ -793,7 +903,7 @@ function enemyTurn() {
   // 敵編隊の行動（発見→接近→攻撃→帰還）
   for (const sq of [...state.enemy.squadrons]) {
     if (sq.state === 'outbound') {
-      if (hexDistance(sq, state.carrier) <= (sq.vision || 10)) {
+      if (hexDistance(sq, state.carrier) <= (sq.vision || VISION_SQUADRON)) {
         stepOnGridTowards(sq, state.carrier, sq.speed, { stopRange: 1, avoid: true, ignoreId: sq.id, passIslands: true });
         if (hexDistance(sq, state.carrier) <= 1) {
           const dmg = scaledDamage(sq, 25);
@@ -872,6 +982,35 @@ function nearestSea(x, y) {
   return { x, y };
 }
 
+// === Turn Visibility (player) ===
+function visibilityKey(x, y) { return `${x},${y}`; }
+function isTurnVisible(x, y) { return state.turnVisible.has(visibilityKey(x, y)); }
+function clearTurnVisibility() { state.turnVisible = new Set(); }
+function markVisibilityCircle(cx, cy, range) {
+  const R = Math.max(0, range | 0);
+  for (let y = Math.max(0, cy - (R + 2)); y < Math.min(MAP_H, cy + (R + 3)); y++) {
+    for (let x = Math.max(0, cx - (R + 2)); x < Math.min(MAP_W, cx + (R + 3)); x++) {
+      if (hexDistance({ x, y }, { x: cx, y: cy }) <= R) {
+        state.turnVisible.add(visibilityKey(x, y));
+      }
+    }
+  }
+}
+function computeTurnVisibility(pathSweep) {
+  clearTurnVisibility();
+  // 現在位置の視界（自軍）
+  markVisibilityCircle(state.carrier.x, state.carrier.y, state.carrier.vision);
+  for (const sq of state.squadrons) {
+    if (sq.state !== 'base' && sq.state !== 'lost' && sq.x != null && sq.y != null) {
+      markVisibilityCircle(sq.x, sq.y, sq.vision || VISION_SQUADRON);
+    }
+  }
+  // 今ターンの移動経路に沿ったスイープ視界
+  for (const step of pathSweep || []) {
+    markVisibilityCircle(step.x, step.y, step.range || 0);
+  }
+}
+
 function updatePlayerIntel() {
   // 敵空母
   const c = state.enemy.carrier;
@@ -936,8 +1075,8 @@ function restartGame(kind) {
   // reset state fields (keep same objects to avoid re-binding)
   state.turn = 1;
   state.mode = 'select';
-  state.carrier = { id: 'C1', x: 3, y: 3, hp: 100, speed: 2, vision: 10, hangar: 2 };
-  state.enemy = { carrier: { id: 'E1', x: 26, y: 26, hp: 100, speed: 2, vision: 10, hangar: 2 }, squadrons: [] };
+  state.carrier = { id: 'C1', x: 3, y: 3, hp: 100, speed: 2, vision: VISION_CARRIER, hangar: 2, target: null };
+  state.enemy = { carrier: { id: 'E1', x: 26, y: 26, hp: 100, speed: 2, vision: VISION_CARRIER, hangar: 2 }, squadrons: [] };
   state.intel = { carrier: { seen: false, x: null, y: null, ttl: 0 }, squadrons: new Map() };
   state.enemyIntel = { carrier: { seen: false, x: null, y: null, ttl: 0 } };
   state.enemyAI = { patrolIx: 0, lastPatrolTurn: 0 };
@@ -957,6 +1096,7 @@ function restartGame(kind) {
   setHint();
   clearLog();
   logMsg(kind === 'newmap' ? '新しい海域で作戦開始: ターン1' : 'リスタート: ターン1');
+  computeTurnVisibility([]);
   renderAll();
 }
 

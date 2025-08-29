@@ -23,14 +23,12 @@
     </header>
     <main class="layout">
       <section class="map-wrap">
-        <canvas id="mapCanvas" width="600" height="600" aria-label="戦場マップ"></canvas>
+        <canvas id="mapCanvas" width="373" height="373" aria-label="戦場マップ"></canvas>
         <div id="legend" class="legend">
-          <div><span class="chip chip-water"></span>海</div>
-          <div><span class="chip chip-island"></span>島</div>
-          <div><span class="chip chip-carrier"></span>自軍空母</div>
-          <div><span class="chip chip-squad"></span>航空機編隊（円）</div>
+          <div><span class="chip chip-carrier"></span>空母</div>
+          <div><span class="chip chip-squad"></span>航空機</div>
           <div><span class="chip" style="background: var(--enemy); border: 1px solid #7a2c2c"></span>敵空母（発見時）</div>
-          <div><span class="chip" style="background: var(--enemy-squad); border: 1px solid #7a522c"></span>敵編隊（ひし形・発見時）</div>
+          <div><span class="chip" style="background: var(--enemy-squad); border: 1px solid #7a522c"></span>敵編隊（発見時）</div>
         </div>
       </section>
       <aside class="sidebar">
