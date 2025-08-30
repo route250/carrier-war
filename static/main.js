@@ -94,13 +94,26 @@ function generateMap() {
 }
 
 function placeEnemyCarrier() {
-  // 右下付近の海タイルを探す
+  // 右下クォドラントの中でランダムに海タイルを選ぶ（範囲を広げる）
+  const minX = Math.floor(MAP_W * 0.6);
+  const minY = Math.floor(MAP_H * 0.6);
+  const maxX = MAP_W - 2;
+  const maxY = MAP_H - 2;
   let ex = MAP_W - 4, ey = MAP_H - 4;
-  for (let yy = MAP_H - 5; yy >= MAP_H - 10; yy--) {
-    for (let xx = MAP_W - 5; xx >= MAP_W - 10; xx--) {
-      if (xx >= 0 && yy >= 0 && state.map[yy] && state.map[yy][xx] === 0) { ex = xx; ey = yy; break; }
+  let found = false;
+  for (let tries = 0; tries < 200; tries++) {
+    const xx = clamp(rand(minX, maxX), 0, MAP_W - 1);
+    const yy = clamp(rand(minY, maxY), 0, MAP_H - 1);
+    if (state.map[yy] && state.map[yy][xx] === 0) { ex = xx; ey = yy; found = true; break; }
+  }
+  if (!found) {
+    // フォールバック: 右下広めの領域を走査
+    for (let yy = MAP_H - 3; yy >= Math.floor(MAP_H * 0.5); yy--) {
+      for (let xx = MAP_W - 3; xx >= Math.floor(MAP_W * 0.5); xx--) {
+        if (xx >= 0 && yy >= 0 && state.map[yy] && state.map[yy][xx] === 0) { ex = xx; ey = yy; found = true; break; }
+      }
+      if (found) break;
     }
-    if (state.map[ey] && state.map[ey][ex] === 0) break;
   }
   state.enemy.carrier.x = ex; state.enemy.carrier.y = ey;
   // 敵も初期周辺は海に（初手で詰まないように）
@@ -452,8 +465,10 @@ function tryLaunchStrike(tx, ty) {
 }
 
 // === Turn ===
-function nextTurn() {
+async function nextTurn() {
   if (state.gameOver) return;
+  // avoid double-click during async call
+  try { el.btnNextTurn.disabled = true; } catch {}
   state.turn += 1;
 
   // このターンで移動した経路を収集（自軍のみ）
@@ -547,8 +562,14 @@ function nextTurn() {
     }
   }
 
-  // 2) 敵AI：空母移動/出撃/編隊行動
-  enemyTurn();
+  // 2) 敵AI：サーバAIにプランを要求し、行動を適用
+  try {
+    const req = buildAiPlanRequest();
+    const plan = await callAiPlan(req);
+    enemyTurnFromPlan(plan);
+  } catch (e) {
+    logMsg(`AIプラン取得エラー: ${e && e.message ? e.message : e}`);
+  }
 
   // 3) 今ターンの可視範囲（自軍の現在位置＋移動経路スイープ）を計算
   computeTurnVisibility(pathSweep);
@@ -560,6 +581,7 @@ function nextTurn() {
   // 5) 勝敗判定
   checkGameEnd();
   logMsg(`ターン${state.turn}`);
+  try { el.btnNextTurn.disabled = false; } catch {}
 }
 
 // === Utils ===
@@ -848,6 +870,150 @@ function offsetNeighbors(c, r) {
     ? [[+1,0],[+1,-1],[0,-1],[-1,0],[0,+1],[+1,+1]]
     : [[+1,0],[0,-1],[-1,-1],[-1,0],[-1,+1],[0,+1]];
   return deltas.map(([dc, dr]) => ({ x: c + dc, y: r + dr }));
+}
+
+// === Server AI Integration ===
+function buildAiPlanRequest() {
+  // 敵視点の我が空母観測を更新（見えていれば上書き、見えなければ現メモリを維持）
+  let mem = state.enemyIntel && state.enemyIntel.carrier ? { ...state.enemyIntel.carrier } : { seen: false, x: null, y: null, ttl: 0 };
+  if (isVisibleToEnemy(state.carrier.x, state.carrier.y)) {
+    mem = { seen: true, x: state.carrier.x, y: state.carrier.y, ttl: 3 };
+  }
+
+  const visiblePlayerSquadrons = state.squadrons
+    .filter((s) => s.state !== 'base' && s.state !== 'lost' && s.x != null && s.y != null && isVisibleToEnemy(s.x, s.y))
+    .map((s) => ({ id: s.id, x: s.x, y: s.y }));
+
+  return {
+    turn: state.turn,
+    map: state.map,
+    enemy_state: {
+      carrier: { ...state.enemy.carrier },
+      squadrons: state.enemy.squadrons.map((s) => ({ id: s.id, state: s.state, hp: s.hp ?? SQUAD_MAX_HP, x: s.x, y: s.y, target: s.target }))
+    },
+    enemy_memory: { carrier_last_seen: mem, enemy_ai: { patrol_ix: state.enemyAI.patrolIx, last_patrol_turn: state.enemyAI.lastPatrolTurn } },
+    player_observation: { visible_squadrons: visiblePlayerSquadrons },
+    config: { difficulty: 'normal', time_ms: 50 },
+  };
+}
+
+async function callAiPlan(body) {
+  const res = await fetch('/v1/ai/plan', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(body),
+  });
+  if (!res.ok) {
+    const txt = await res.text().catch(() => '');
+    throw new Error(`status ${res.status} ${txt}`);
+  }
+  return await res.json();
+}
+
+function enemyTurnFromPlan(plan) {
+  const ec = state.enemy.carrier;
+
+  // 1) 空母移動
+  if (plan && plan.carrier_order) {
+    const co = plan.carrier_order;
+    if (co.type === 'move' && co.target && typeof co.target.x === 'number' && typeof co.target.y === 'number') {
+      // サーバ側は海・範囲内を保証する想定。占有だけ軽く回避。
+      if (!isOccupied(co.target.x, co.target.y, { ignore: { type: 'carrier', side: 'enemy' } })) {
+        ec.x = co.target.x; ec.y = co.target.y;
+      }
+    }
+  }
+
+  // 2) 出撃/その他オーダーの適用（現状はlaunchのみ）
+  if (plan && Array.isArray(plan.squadron_orders)) {
+    for (const od of plan.squadron_orders) {
+      const sq = state.enemy.squadrons.find((s) => s.id === od.id);
+      if (!sq) continue;
+      if (od.action === 'launch' && od.target) {
+        let t = { x: od.target.x | 0, y: od.target.y | 0 };
+        t = clampTargetToRange(ec, t, SQUADRON_RANGE);
+        const spawn = findFreeAdjacent(ec.x, ec.y, { preferAwayFrom: t });
+        if (spawn && sq.state === 'base' && (sq.hp ?? SQUAD_MAX_HP) > 0) {
+          sq.x = spawn.x; sq.y = spawn.y; sq.target = t; sq.state = 'outbound'; sq.speed = 10; sq.vision = VISION_SQUADRON;
+          logMsg('敵編隊が出撃した気配');
+        }
+      } else if (od.action === 'return') {
+        if (sq.state !== 'base' && sq.state !== 'lost') sq.state = 'returning';
+      } else if (od.action === 'engage' && od.target) {
+        // 既存のロジックに合わせ、targetはプレイヤー空母想定で接敵へ
+        if (sq.state !== 'base' && sq.state !== 'lost') { sq.target = { x: od.target.x, y: od.target.y }; sq.state = 'engaging'; }
+      }
+    }
+  }
+
+  // 3) メモリ更新（TTL減衰等）
+  if (plan && plan.enemy_memory_out && plan.enemy_memory_out.carrier_last_seen) {
+    state.enemyIntel.carrier = { ...plan.enemy_memory_out.carrier_last_seen };
+  }
+  if (plan && plan.enemy_memory_out && plan.enemy_memory_out.enemy_ai) {
+    const ai = plan.enemy_memory_out.enemy_ai;
+    state.enemyAI.patrolIx = ai.patrol_ix | 0;
+    state.enemyAI.lastPatrolTurn = ai.last_patrol_turn | 0;
+  }
+
+  // 4) 受け取ったログを表示（任意）
+  if (plan && Array.isArray(plan.logs)) {
+    for (const m of plan.logs) logMsg(m);
+  }
+
+  // 5) 敵編隊の行動進行（接敵・攻撃・帰還）
+  progressEnemySquadrons();
+}
+
+function progressEnemySquadrons() {
+  const ec = state.enemy.carrier;
+  for (const sq of [...state.enemy.squadrons]) {
+    if (sq.state === 'outbound') {
+      if (hexDistance(sq, state.carrier) <= (sq.vision || VISION_SQUADRON)) {
+        stepOnGridTowards(sq, state.carrier, sq.speed, { stopRange: 1, avoid: true, ignoreId: sq.id, passIslands: true });
+        if (hexDistance(sq, state.carrier) <= 1) {
+          const dmg = scaledDamage(sq, 25);
+          state.carrier.hp = Math.max(0, state.carrier.hp - dmg);
+          logMsg(`敵編隊が我が空母を攻撃（${dmg}） 残HP:${state.carrier.hp}`);
+          const aa = scaledAA(state.carrier, 20);
+          sq.hp = Math.max(0, (sq.hp ?? SQUAD_MAX_HP) - aa);
+          logMsg(`敵編隊${sq.id} が対空砲火を受けた（${aa}） 残HP:${sq.hp}`);
+          if (sq.hp <= 0) {
+            logMsg(`敵編隊${sq.id} は撃墜された`);
+            sq.state = 'lost'; delete sq.x; delete sq.y; delete sq.target;
+          } else {
+            sq.state = 'returning';
+          }
+        } else {
+          sq.state = 'engaging';
+        }
+      } else {
+        stepOnGridTowards(sq, sq.target, sq.speed, { avoid: true, ignoreId: sq.id, passIslands: true });
+        if (sq.x === sq.target.x && sq.y === sq.target.y) {
+          sq.state = 'returning';
+        }
+      }
+    } else if (sq.state === 'engaging') {
+      stepOnGridTowards(sq, state.carrier, sq.speed, { stopRange: 1, avoid: true, ignoreId: sq.id, passIslands: true });
+      if (hexDistance(sq, state.carrier) <= 1) {
+        const dmg = scaledDamage(sq, 25);
+        state.carrier.hp = Math.max(0, state.carrier.hp - dmg);
+        logMsg(`敵編隊が我が空母を攻撃（${dmg}） 残HP:${state.carrier.hp}`);
+        const aa = scaledAA(state.carrier, 20);
+        sq.hp = Math.max(0, (sq.hp ?? SQUAD_MAX_HP) - aa);
+        logMsg(`敵編隊${sq.id} が対空砲火を受けた（${aa}） 残HP:${sq.hp}`);
+        if (sq.hp <= 0) {
+          logMsg(`敵編隊${sq.id} は撃墜された`);
+          sq.state = 'lost'; delete sq.x; delete sq.y; delete sq.target;
+        } else {
+          sq.state = 'returning';
+        }
+      }
+    } else if (sq.state === 'returning') {
+      stepOnGridTowards(sq, ec, sq.speed, { stopRange: 1, avoid: true, ignoreId: sq.id, passIslands: true });
+      if (hexDistance(sq, ec) <= 1) { sq.state = 'base'; delete sq.x; delete sq.y; delete sq.target; }
+    }
+  }
 }
 
 function enemyTurn() {

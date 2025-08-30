@@ -1,26 +1,48 @@
 from pathlib import Path
+import sys
 
 from fastapi import FastAPI
+from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
 import uvicorn
 
 # Resolve project root (two levels up from this file: server/main.py -> project root)
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
+# Ensure project root on sys.path so `import server.*` works when running as a script
+if str(PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(PROJECT_ROOT))
 STATIC_DIR = PROJECT_ROOT / "static"
 
 app = FastAPI()
 
-# Serve all files in ./static at the root path.
-# With html=True, a request to "/" returns index.html if present.
+# Mount static files at /static
 app.mount(
-    "/",
-    StaticFiles(directory=str(STATIC_DIR), html=True),
+    "/static",
+    StaticFiles(directory=str(STATIC_DIR), html=False),
     name="static",
 )
 
 
-# If you later need API routes, consider mounting static at '/static'
-# and adding an explicit route for '/'.
+# Root serves index.html
+@app.get("/")
+def read_index():
+    return FileResponse(str(STATIC_DIR / "index.html"))
+
+
+# Health check
+@app.get("/healthz")
+def healthz():
+    return {"status": "ok"}
+
+
+# API routers
+try:
+    from server.routers.ai import router as ai_router
+    app.include_router(ai_router, prefix="/v1/ai", tags=["ai"])
+except Exception:
+    # Router will be added when available; app remains functional for static hosting
+    pass
+
 
 if __name__ == "__main__":
     uvicorn.run(app, host="0.0.0.0", port=8000)
