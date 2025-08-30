@@ -39,9 +39,14 @@ def healthz():
 try:
     from server.routers.ai import router as ai_router
     app.include_router(ai_router, prefix="/v1/ai", tags=["ai"])
-except Exception:
-    # Router will be added when available; app remains functional for static hosting
-    pass
+except Exception as e:
+    print(f"Failed to load AI router: {e}")
+
+try:
+    from server.routers.session import router as session_router
+    app.include_router(session_router, prefix="/v1/session", tags=["session"])
+except Exception as e:
+    print(f"Failed to load Session router: {e}")
 
 
 if __name__ == "__main__":

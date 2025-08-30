@@ -62,10 +62,14 @@ function init() {
   // 初期編隊（基地待機、HPはゲーム中回復しない）
   state.squadrons = Array.from({ length: state.carrier.hangar }, (_, i) => ({ id: `SQ${i + 1}`, hp: SQUAD_MAX_HP, state: 'base' }));
   state.enemy.squadrons = Array.from({ length: state.enemy.carrier.hangar }, (_, i) => ({ id: `ESQ${i + 1}`, hp: SQUAD_MAX_HP, state: 'base' }));
+  // サーバセッションを作成
+  ensureSession()
+    .then((sid)=>{ if (sid) logMsg(`作戦開始: ターン1 (session: ${sid})`); })
+    .catch((e)=>{ logMsg(`セッション初期化エラー: ${e && e.message ? e.message : e}`); });
   // 初期可視範囲（自軍現在位置のみ）
   computeTurnVisibility([]);
   renderAll();
-  logMsg('作戦開始: ターン1');
+  // 作戦開始ログは ensureSession 完了時に出す
   setHint();
 }
 
@@ -222,6 +226,12 @@ function renderUnits() {
   }
 
   // launch mode: dashed range outline removed (hover color indicates validity)
+  // pending launch preview: show planned strike line (from spawn or carrier to target)
+  if (typeof PENDING_LAUNCH === 'object' && PENDING_LAUNCH && typeof PENDING_LAUNCH.x === 'number' && typeof PENDING_LAUNCH.y === 'number') {
+    const t = { x: PENDING_LAUNCH.x, y: PENDING_LAUNCH.y };
+    let from = findFreeAdjacent(state.carrier.x, state.carrier.y, { preferAwayFrom: t }) || { x: state.carrier.x, y: state.carrier.y };
+    drawLineTile(from.x, from.y, t.x, t.y, 'rgba(242,193,78,0.5)');
+  }
 
   // squadrons
   for (const sq of state.squadrons) {
@@ -451,12 +461,20 @@ function setCarrierDestination(x, y) {
 }
 
 function tryLaunchStrike(tx, ty) {
+  // セッション運用時はサーバへ発艦指示のみ送る（次のターンで処理）
+  if (SESSION_ID) {
+    if (countBaseAvailable() <= 0) { logMsg('搭載機がありません'); return; }
+    if (hexDistance({ x: tx, y: ty }, state.carrier) > SQUADRON_RANGE) { logMsg(`航続距離外です（最大${SQUADRON_RANGE}）`); return; }
+    PENDING_LAUNCH = { x: tx, y: ty };
+    logMsg(`発艦指示を登録（${tx}, ${ty}） 次のターンで出撃`);
+    renderAll();
+    return;
+  }
+  // ローカル運用（非セッション、参考用）
   if (countBaseAvailable() <= 0) { logMsg('搭載機がありません'); return; }
   const sq = state.squadrons.find((s)=>s.state==='base' && s.hp>0);
   if (!sq) { logMsg('搭載機がありません'); return; }
-  // 航続距離チェック（空母からの距離がSQUADRON_RANGE以内）
   if (hexDistance({ x: tx, y: ty }, state.carrier) > SQUADRON_RANGE) { logMsg(`航続距離外です（最大${SQUADRON_RANGE}）`); return; }
-  // 発艦位置は空母の周囲の空きマス
   const spawn = findFreeAdjacent(state.carrier.x, state.carrier.y, { preferAwayFrom: { x: tx, y: ty } });
   if (!spawn) { logMsg('発艦スペースがありません'); return; }
   sq.x = spawn.x; sq.y = spawn.y; sq.target = { x: tx, y: ty }; sq.state = 'outbound'; sq.speed = 10; sq.vision = VISION_SQUADRON;
@@ -474,26 +492,29 @@ async function nextTurn() {
   // このターンで移動した経路を収集（自軍のみ）
   const pathSweep = [];// array of {x,y,range}
 
-  // 0) 空母の自動移動（目的地に向けて毎ターン進む。毎ターン目的地変更可）
-  if (state.carrier.target) {
-    const before = { x: state.carrier.x, y: state.carrier.y };
-    const tgt = state.carrier.target;
-    if (before.x !== tgt.x || before.y !== tgt.y) {
-      const path = [];
-      stepOnGridTowards(state.carrier, tgt, state.carrier.speed, { avoid: true, passIslands: false, trackPath: path, trackVisionRange: state.carrier.vision });
-      pathSweep.push(...path);
-      const after = { x: state.carrier.x, y: state.carrier.y };
-      if (after.x === tgt.x && after.y === tgt.y) {
-        logMsg(`空母が目的地(${tgt.x}, ${tgt.y})に到達`);
-        state.carrier.target = null;
-      } else if (after.x !== before.x || after.y !== before.y) {
-        logMsg(`空母が(${before.x}, ${before.y})→(${after.x}, ${after.y})へ前進`);
+  // 0) プレイヤー側の移動/自軍編隊行動はサーバ側で解決（セッション利用時）
+  //    セッション未使用時のみローカルで進行（現在は常にセッション使用）
+  if (!SESSION_ID) {
+    if (state.carrier.target) {
+      const before = { x: state.carrier.x, y: state.carrier.y };
+      const tgt = state.carrier.target;
+      if (before.x !== tgt.x || before.y !== tgt.y) {
+        const path = [];
+        stepOnGridTowards(state.carrier, tgt, state.carrier.speed, { avoid: true, passIslands: false, trackPath: path, trackVisionRange: state.carrier.vision });
+        pathSweep.push(...path);
+        const after = { x: state.carrier.x, y: state.carrier.y };
+        if (after.x === tgt.x && after.y === tgt.y) {
+          logMsg(`空母が目的地(${tgt.x}, ${tgt.y})に到達`);
+          state.carrier.target = null;
+        } else if (after.x !== before.x || after.y !== before.y) {
+          logMsg(`空母が(${before.x}, ${before.y})→(${after.x}, ${after.y})へ前進`);
+        }
       }
     }
   }
 
   // 1) 自軍編隊の行動（発見→接近→同ターン攻撃可→帰還）
-  for (const sq of [...state.squadrons]) {
+  if (!SESSION_ID) for (const sq of [...state.squadrons]) {
     const ec = state.enemy.carrier;
     if (sq.state === 'outbound') {
       // 索敵に入ったら接近。1マス以内に到達できたらこのターンで攻撃。
@@ -562,20 +583,23 @@ async function nextTurn() {
     }
   }
 
-  // 2) 敵AI：サーバAIにプランを要求し、行動を適用
+  // 2) 敵AI：サーバでターン解決（セッション）またはAIプランのみ取得
   try {
-    const req = buildAiPlanRequest();
-    const plan = await callAiPlan(req);
+    const req = buildSessionStepRequest();
+    const plan = await callSessionStep(req);
     enemyTurnFromPlan(plan);
   } catch (e) {
     logMsg(`AIプラン取得エラー: ${e && e.message ? e.message : e}`);
   }
 
-  // 3) 今ターンの可視範囲（自軍の現在位置＋移動経路スイープ）を計算
-  computeTurnVisibility(pathSweep);
+  // 3) 可視範囲の更新
+  if (!SESSION_ID) {
+    // ローカル計算
+    computeTurnVisibility(pathSweep);
+  }
 
   // 4) 可視情報更新（player側表示用）
-  updatePlayerIntel();
+  if (!SESSION_ID) updatePlayerIntel();
   renderAll();
 
   // 5) 勝敗判定
@@ -872,7 +896,7 @@ function offsetNeighbors(c, r) {
   return deltas.map(([dc, dr]) => ({ x: c + dc, y: r + dr }));
 }
 
-// === Server AI Integration ===
+// === Server AI Integration (stateless legacy kept) ===
 function buildAiPlanRequest() {
   // 敵視点の我が空母観測を更新（見えていれば上書き、見えなければ現メモリを維持）
   let mem = state.enemyIntel && state.enemyIntel.carrier ? { ...state.enemyIntel.carrier } : { seen: false, x: null, y: null, ttl: 0 };
@@ -910,10 +934,121 @@ async function callAiPlan(body) {
   return await res.json();
 }
 
+// === Session (stateful) ===
+let SESSION_ID = null;
+
+async function ensureSession() {
+  if (SESSION_ID) return SESSION_ID;
+  const enemy_state = {
+    carrier: { ...state.enemy.carrier },
+    squadrons: state.enemy.squadrons.map((s) => ({ id: s.id, state: s.state, hp: s.hp ?? SQUAD_MAX_HP, x: s.x, y: s.y, target: s.target }))
+  };
+  const player_state = {
+    carrier: { ...state.carrier },
+    squadrons: state.squadrons.map((s) => ({ id: s.id, state: s.state, hp: s.hp ?? SQUAD_MAX_HP, x: s.x, y: s.y, target: s.target }))
+  };
+  const res = await fetch('/v1/session/', {
+    method: 'POST', headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ map: state.map, enemy_state, player_state })
+  });
+  if (!res.ok) throw new Error(`session create failed: ${res.status}`);
+  const data = await res.json();
+  SESSION_ID = data.session_id;
+  // sync any authoritative fields back if needed
+  state.enemy.carrier = { ...state.enemy.carrier, ...data.enemy_state.carrier };
+  state.carrier = { ...state.carrier, ...data.player_state.carrier };
+  // enemy_memory on client is state.enemyIntel; for now, keep local flow and let server track memory
+  return SESSION_ID;
+}
+
+function buildSessionStepRequest() {
+  const visibleCarrier = isVisibleToEnemy(state.carrier.x, state.carrier.y) ? { x: state.carrier.x, y: state.carrier.y } : null;
+  const visiblePlayerSquadrons = state.squadrons
+    .filter((s) => s.state !== 'base' && s.state !== 'lost' && s.x != null && s.y != null && isVisibleToEnemy(s.x, s.y))
+    .map((s) => ({ id: s.id, x: s.x, y: s.y }));
+  const player_orders = buildPlayerOrders();
+  return {
+    player_visible_carrier: visibleCarrier,
+    player_observation: { visible_squadrons: visiblePlayerSquadrons },
+    player_carrier_hp: state.carrier.hp,
+    player_orders,
+    config: { difficulty: 'normal', time_ms: 50 },
+  };
+}
+
+let PENDING_LAUNCH = null;
+function buildPlayerOrders() {
+  const orders = {};
+  if (state.carrier.target) orders.carrier_target = { x: state.carrier.target.x, y: state.carrier.target.y };
+  if (PENDING_LAUNCH) orders.launch_target = { x: PENDING_LAUNCH.x, y: PENDING_LAUNCH.y };
+  PENDING_LAUNCH = null; // consume
+  return orders;
+}
+
+async function callSessionStep(body) {
+  await ensureSession();
+  const res = await fetch(`/v1/session/${SESSION_ID}/step`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) });
+  if (!res.ok) {
+    const txt = await res.text().catch(()=> '');
+    throw new Error(`status ${res.status} ${txt}`);
+  }
+  return await res.json();
+}
+
 function enemyTurnFromPlan(plan) {
   const ec = state.enemy.carrier;
 
-  // 1) 空母移動
+  // Server-authoritative branch (session step)
+  if (plan && plan.enemy_state) {
+    // apply enemy carrier
+    state.enemy.carrier = { ...state.enemy.carrier, ...plan.enemy_state.carrier };
+    // apply enemy squadrons
+    state.enemy.squadrons = (plan.enemy_state.squadrons || []).map((s) => ({ id: s.id, state: s.state, hp: s.hp ?? SQUAD_MAX_HP, x: s.x ?? undefined, y: s.y ?? undefined, target: s.target ? { x: s.target.x, y: s.target.y } : undefined, speed: s.speed ?? 10, vision: s.vision ?? VISION_SQUADRON }));
+    // apply player carrier and squadrons (authoritative)
+    if (plan.player_state) {
+      state.carrier = { ...state.carrier, ...plan.player_state.carrier };
+      state.squadrons = (plan.player_state.squadrons || []).map((s) => ({ id: s.id, state: s.state, hp: s.hp ?? SQUAD_MAX_HP, x: s.x ?? undefined, y: s.y ?? undefined, target: s.target ? { x: s.target.x, y: s.target.y } : undefined, speed: s.speed ?? 10, vision: s.vision ?? VISION_SQUADRON }));
+    }
+    // memory
+    if (plan.enemy_memory_out && plan.enemy_memory_out.carrier_last_seen) {
+      state.enemyIntel.carrier = { ...plan.enemy_memory_out.carrier_last_seen };
+    }
+    if (plan.enemy_memory_out && plan.enemy_memory_out.enemy_ai) {
+      const ai = plan.enemy_memory_out.enemy_ai;
+      state.enemyAI.patrolIx = ai.patrol_ix | 0;
+      state.enemyAI.lastPatrolTurn = ai.last_patrol_turn | 0;
+    }
+    // player intel from server
+    if (plan.player_intel) {
+      if (plan.player_intel.carrier) {
+        state.intel.carrier = { ...plan.player_intel.carrier };
+      }
+      if (Array.isArray(plan.player_intel.squadrons)) {
+        const mp = new Map();
+        for (const item of plan.player_intel.squadrons) {
+          if (item && item.id && item.marker) {
+            mp.set(item.id, { ...item.marker });
+          }
+        }
+        state.intel.squadrons = mp;
+      }
+    }
+    // server-computed visibility
+    if (Array.isArray(plan.turn_visible)) {
+      state.turnVisible = new Set(plan.turn_visible);
+    }
+    // game status
+    if (plan.game_status && plan.game_status.over && !state.gameOver) {
+      const res = plan.game_status.result || 'draw';
+      const msg = plan.game_status.message || (res === 'win' ? '勝利' : res === 'lose' ? '敗北' : '引き分け');
+      finishGame(res, msg);
+    }
+    // logs
+    if (Array.isArray(plan.logs)) for (const m of plan.logs) logMsg(m);
+    return;
+  }
+
+  // 1) 空母移動（stateless fallback）
   if (plan && plan.carrier_order) {
     const co = plan.carrier_order;
     if (co.type === 'move' && co.target && typeof co.target.x === 'number' && typeof co.target.y === 'number') {
@@ -1262,6 +1397,9 @@ function restartGame(kind) {
   setHint();
   clearLog();
   logMsg(kind === 'newmap' ? '新しい海域で作戦開始: ターン1' : 'リスタート: ターン1');
+  // Reset session and create a new one for the new map/state
+  SESSION_ID = null;
+  ensureSession().catch(()=>{});
   computeTurnVisibility([]);
   renderAll();
 }

@@ -48,6 +48,16 @@ class EnemyMemory(BaseModel):
     enemy_ai: Optional[EnemyAIState] = None
 
 
+class SquadronIntel(BaseModel):
+    id: str
+    marker: IntelMarker
+
+
+class PlayerIntel(BaseModel):
+    carrier: Optional[IntelMarker] = None
+    squadrons: List[SquadronIntel] = []
+
+
 class SquadronLight(BaseModel):
     id: str
     x: int
@@ -91,3 +101,66 @@ class PlanResponse(BaseModel):
     logs: List[str] = []
     metrics: Dict[str, Any] = {}
     request_id: str
+
+
+# === Session (Step 2) ===
+class SessionCreateRequest(BaseModel):
+    map: List[List[int]]
+    enemy_state: Optional[EnemyState] = None
+    player_state: Optional[EnemyState] = None
+    config: Optional[Config] = None
+    rand_seed: Optional[int] = None
+
+
+class SessionCreateResponse(BaseModel):
+    session_id: str
+    enemy_state: EnemyState
+    enemy_memory: EnemyMemory
+    player_state: EnemyState
+    config: Optional[Config] = None
+
+
+class PlayerOrders(BaseModel):
+    carrier_target: Optional[Position] = None
+    launch_target: Optional[Position] = None
+
+
+class SessionStepRequest(BaseModel):
+    # What the enemy can see about the player
+    player_visible_carrier: Optional[Position] = None
+    player_observation: Optional[PlayerObservation] = None
+    # For server-side combat resolution (AA scaling)
+    player_carrier_hp: Optional[int] = None
+    # Player commands for server-side resolution
+    player_orders: Optional[PlayerOrders] = None
+    config: Optional[Config] = None
+
+
+class StepEffects(BaseModel):
+    player_carrier_damage: int = 0
+
+
+class GameStatus(BaseModel):
+    over: bool = False
+    result: Optional[Literal['win','lose','draw']] = None
+    message: Optional[str] = None
+    turn: Optional[int] = None
+
+
+class SessionStepResponse(BaseModel):
+    # Keep these for introspection/compat
+    carrier_order: Optional[CarrierOrder] = None
+    squadron_orders: List[SquadronOrder] = []
+    # Authoritative enemy state after applying orders and progression
+    enemy_state: EnemyState
+    player_state: EnemyState
+    enemy_memory_out: Optional[EnemyMemory] = None
+    effects: StepEffects = StepEffects()
+    logs: List[str] = []
+    metrics: Dict[str, Any] = {}
+    request_id: str
+    # Server-computed visibility for player ("x,y" keys)
+    turn_visible: List[str] = []
+    game_status: Optional[GameStatus] = None
+    # Player intel (server-computed memory based on visibility)
+    player_intel: Optional[PlayerIntel] = None
