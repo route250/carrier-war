@@ -37,13 +37,13 @@ def healthz():
 
 # API routers
 try:
-    from server.routers.ai import router as ai_router
+    from server.routers.ai_router import router as ai_router
     app.include_router(ai_router, prefix="/v1/ai", tags=["ai"])
 except Exception as e:
     print(f"Failed to load AI router: {e}")
 
 try:
-    from server.routers.session import router as session_router
+    from server.routers.session_router import router as session_router
     app.include_router(session_router, prefix="/v1/session", tags=["session"])
 except Exception as e:
     print(f"Failed to load Session router: {e}")

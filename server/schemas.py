@@ -105,18 +105,17 @@ class PlanResponse(BaseModel):
 
 # === Session (Step 2) ===
 class SessionCreateRequest(BaseModel):
-    map: List[List[int]]
-    enemy_state: Optional[EnemyState] = None
-    player_state: Optional[EnemyState] = None
     config: Optional[Config] = None
     rand_seed: Optional[int] = None
 
 
 class SessionCreateResponse(BaseModel):
     session_id: str
+    map: List[List[int]]
     enemy_state: EnemyState
     enemy_memory: EnemyMemory
     player_state: EnemyState
+    turn: int = 1
     config: Optional[Config] = None
 
 
@@ -126,11 +125,6 @@ class PlayerOrders(BaseModel):
 
 
 class SessionStepRequest(BaseModel):
-    # What the enemy can see about the player
-    player_visible_carrier: Optional[Position] = None
-    player_observation: Optional[PlayerObservation] = None
-    # For server-side combat resolution (AA scaling)
-    player_carrier_hp: Optional[int] = None
     # Player commands for server-side resolution
     player_orders: Optional[PlayerOrders] = None
     config: Optional[Config] = None
@@ -148,6 +142,8 @@ class GameStatus(BaseModel):
 
 
 class SessionStepResponse(BaseModel):
+    session_id: str
+    turn: int
     # Keep these for introspection/compat
     carrier_order: Optional[CarrierOrder] = None
     squadron_orders: List[SquadronOrder] = []
@@ -159,7 +155,6 @@ class SessionStepResponse(BaseModel):
     logs: List[str] = []
     metrics: Dict[str, Any] = {}
     request_id: str
-    # Server-computed visibility for player ("x,y" keys)
     turn_visible: List[str] = []
     game_status: Optional[GameStatus] = None
     # Player intel (server-computed memory based on visibility)
