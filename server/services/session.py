@@ -6,11 +6,12 @@ from dataclasses import dataclass, field
 from typing import Dict, Optional
 
 from server.schemas import (
+    GameStatus,
     SessionCreateRequest,
     SessionCreateResponse,
     SessionStepRequest,
     SessionStepResponse,
-    EnemyState,
+    PlayerState,
     CarrierState,
     SquadronState,
     EnemyMemory,
@@ -19,6 +20,7 @@ from server.schemas import (
     PlanRequest,
     SquadronOrder,
     Position,
+    StepEffects, TrackPos,
     PlayerIntel,
     SquadronIntel,
     PlayerObservation,
@@ -28,27 +30,50 @@ from server.services.ai import plan_orders
 from server.utils.audit import audit_write, maplog_write
 
 
-@dataclass
+# ==== Server-side game helpers (enemy side only) ====
+SQUAD_MAX_HP = 40
+CARRIER_MAX_HP = 100
+VISION_SQUADRON = 5
+VISION_CARRIER = 4
+SQUADRON_RANGE = 22
+
+
 class Session:
-    id: str
-    map: list
-    enemy_state: EnemyState
-    player_state: EnemyState
-    enemy_memory: EnemyMemory = field(default_factory=EnemyMemory)
-    rand_seed: Optional[int] = None
-    config: Optional[dict] = None
-    turn: int = 1
-    max_turns: int = 20
-    # Player intel memory (server-side)
-    player_intel_carrier: Optional[IntelMarker] = None
-    player_intel_squadrons: Dict[str, IntelMarker] = field(default_factory=dict)
-    # Cross-turn last positions to avoid immediate backtracking across turns
-    last_pos_player_sq: Dict[str, tuple] = field(default_factory=dict)
-    last_pos_enemy_sq: Dict[str, tuple] = field(default_factory=dict)
-    last_pos_player_carrier: Optional[tuple] = None
-    last_pos_enemy_carrier: Optional[tuple] = None
-    # Map log: remember last user-ordered target to avoid duplicate logs each turn
-    last_logged_player_target: Optional[tuple] = None
+    def __init__(self,
+                 session_id: str,
+                 map: list,
+                 rand_seed: Optional[int] = None,
+                 config: Optional[dict] = None,
+               ):
+
+        self.session_id = session_id
+        self.turn: int = 1
+        self.max_turns: int = 20
+        self.map = map
+        self.rand_seed: Optional[int] = rand_seed
+        self.config: Optional[dict] = config
+
+        enemy_carrier = CarrierState(id="E1", pos=Position(x=26, y=26), hp=CARRIER_MAX_HP, speed=2, vision=4)
+        enemy_squadrons = [SquadronState(id=f"ESQ{i+1}", pos=Position.invalid(), state='base', hp=SQUAD_MAX_HP, speed=4, vision=3) for i in range(enemy_carrier.hangar)]
+        self.enemy_state: PlayerState = PlayerState(carrier=enemy_carrier, squadrons=enemy_squadrons)
+
+        player_carrier = CarrierState(id="C1", pos=Position(x=3, y=3), hp=CARRIER_MAX_HP, speed=2, vision=4)
+        player_squadrons = [SquadronState(id=f"SQ{i+1}", pos=Position.invalid(), state='base', hp=SQUAD_MAX_HP, speed=4, vision=3) for i in range(player_carrier.hangar)]
+        self.player_state: PlayerState = PlayerState(carrier=player_carrier, squadrons=player_squadrons)
+        # Ensure starting positions are on sea (carve small sea around if necessary)
+        _carve_sea(map, self.player_state.carrier.pos, 2)
+        _carve_sea(map, self.enemy_state.carrier.pos, 2)
+        self.enemy_memory: EnemyMemory = EnemyMemory(enemy_ai=EnemyAIState())
+        # Separate AI state (server-internal) for enemy side; mirrored into enemy_memory for AI planning I/O
+        self.enemy_ai_state: EnemyAIState = EnemyAIState()
+
+        # Side intel memory (server-side, symmetric: what each side knows about the other)
+        from server.schemas import SideIntel
+        self.player_intel: SideIntel = SideIntel()
+        self.enemy_intel: SideIntel = SideIntel()
+        # Map log: remember last user-ordered target to avoid duplicate logs each turn
+        self.last_logged_player_target: Optional[Position] = None
+        # PlayerState.carrier_target holds the persistent server-authoritative carrier move target
 
 
 class SessionStore:
@@ -60,43 +85,31 @@ class SessionStore:
         # Map: if not provided, generate a connected one
         width = 30
         height = 30
-        game_map = _generate_connected_map(width, height)
-        # If not provided, seed a minimal enemy state
-        enemy_carrier = CarrierState(id="E1", x=26, y=26)
-        enemy_squadrons = [SquadronState(id=f"ESQ{i+1}", state='base', hp=SQUAD_MAX_HP) for i in range(enemy_carrier.hangar)]
-        enemy_state = EnemyState(carrier=enemy_carrier, squadrons=enemy_squadrons)
 
-        player_carrier = CarrierState(id="C1", x=3, y=3)
-        player_squadrons = [SquadronState(id=f"SQ{i+1}", state='base', hp=SQUAD_MAX_HP) for i in range(player_carrier.hangar)]
-        player_state = EnemyState(carrier=player_carrier, squadrons=player_squadrons)
-       
-        # Ensure starting positions are on sea (carve small sea around if necessary)
-        _carve_sea(game_map, player_state.carrier.x, player_state.carrier.y, 2)
-        _carve_sea(game_map, enemy_state.carrier.x, enemy_state.carrier.y, 2)
         # Regenerate if somehow disconnected after carving
-        for _ in range(10):
-            tmp_sess = Session(
-                id=sid,
-                map=game_map,
-                enemy_state=enemy_state,
-                player_state=player_state,
-                enemy_memory=EnemyMemory(enemy_ai=EnemyAIState()),
-            )
-            ok, sea_total, sea_reached = _validate_sea_connectivity(tmp_sess)
-            if ok:
-                break
-            game_map = _generate_connected_map(width, height)
-            _carve_sea(game_map, player_state.carrier.x, player_state.carrier.y, 2)
-            _carve_sea(game_map, enemy_state.carrier.x, enemy_state.carrier.y, 2)
+        game_map = _generate_connected_map(width, height)
         sess = Session(
-            id=sid,
+            session_id=sid,
             map=game_map,
-            enemy_state=enemy_state,
-            player_state=player_state,
-            enemy_memory=EnemyMemory(enemy_ai=EnemyAIState()),
             rand_seed=req.rand_seed,
             config=req.config.dict() if req.config else None,
         )
+        # Validate sea connectivity (all sea tiles mutually reachable)
+        try:
+            ok, sea_total, sea_reached = _validate_sea_connectivity(sess)
+            audit_write(
+                sid,
+                {
+                    "type": "map_validation",
+                    "ok": ok,
+                    "sea_total": sea_total,
+                    "sea_reached": sea_reached,
+                    "unreached": max(0, sea_total - sea_reached),
+                },
+            )
+        except Exception:
+            pass
+
         self._sessions[sid] = sess
         # Write a session bootstrap record so we can fully reproduce
         try:
@@ -107,8 +120,8 @@ class SessionStore:
                     "map_w": len(sess.map[0]) if sess.map else 0,
                     "map_h": len(sess.map),
                     "map": sess.map,
-                    "player_state": player_state.dict(),
-                    "enemy_state": enemy_state.dict(),
+                    "player_state": sess.player_state.model_dump(),
+                    "enemy_state": sess.enemy_state.model_dump(),
                     "config": (req.config.dict() if req.config else None),
                     "rand_seed": req.rand_seed,
                     "constants": {
@@ -127,21 +140,7 @@ class SessionStore:
             )
         except Exception:
             pass
-        # Validate sea connectivity (all sea tiles mutually reachable)
-        try:
-            ok, sea_total, sea_reached = _validate_sea_connectivity(sess)
-            audit_write(
-                sid,
-                {
-                    "type": "map_validation",
-                    "ok": ok,
-                    "sea_total": sea_total,
-                    "sea_reached": sea_reached,
-                    "unreached": max(0, sea_total - sea_reached),
-                },
-            )
-        except Exception:
-            pass
+
         # Write a compact .map bootstrap file (map only)
         try:
             maplog_write(
@@ -175,20 +174,37 @@ class SessionStore:
         # advance turn counter
         sess.turn += 1
 
-        # Update memory: if player carrier visible, set TTL=3 at provided coords
+        # Update memory: if player carrier visible to enemy, set TTL=3
         player_visible_carrier = _enemy_sees_player_carrier(sess)
         if player_visible_carrier is not None:
-            sess.enemy_memory.carrier_last_seen = IntelMarker(
-                seen=True,
-                x=player_visible_carrier.x,
-                y=player_visible_carrier.y,
-                ttl=3,
-            )
+            intel_marker = IntelMarker(seen=True, pos=player_visible_carrier, ttl=3)
+            # symmetric enemy-side intel
+            sess.enemy_intel.carrier = intel_marker
+            # maintain AI/backcompat memory wrapper
+            sess.enemy_memory.carrier_last_seen = intel_marker
 
         # Compute server-side view of which player squadrons are visible to enemy
         player_observation = _compute_visible_player_squadrons(sess)
+        # Update symmetric enemy intel for player squadrons (TTL decay)
+        try:
+            current_ids = set()
+            for ps in player_observation.visible_squadrons:
+                current_ids.add(ps.id)
+                sess.enemy_intel.squadrons[ps.id] = IntelMarker(seen=True, pos=ps.pos, ttl=3)
+            # decay intel for squadrons not currently visible
+            for sid, marker in list(sess.enemy_intel.squadrons.items()):
+                if sid not in current_ids and marker.ttl > 0:
+                    ttl = max(0, marker.ttl - 1)
+                    sess.enemy_intel.squadrons[sid] = IntelMarker(seen=ttl > 0, pos=marker.pos, ttl=ttl)
+        except Exception:
+            pass
 
         # Build PlanRequest using session state
+        # Mirror AI state into compat enemy_memory for plan interface
+        try:
+            sess.enemy_memory.enemy_ai = sess.enemy_ai_state
+        except Exception:
+            pass
         plan_req = PlanRequest(
             turn=sess.turn,
             map=sess.map,
@@ -202,18 +218,29 @@ class SessionStore:
         # Apply memory out back to session
         if plan_resp.enemy_memory_out is not None:
             sess.enemy_memory = plan_resp.enemy_memory_out
+            # update internal AI state from response
+            try:
+                if plan_resp.enemy_memory_out.enemy_ai is not None:
+                    sess.enemy_ai_state = plan_resp.enemy_memory_out.enemy_ai
+            except Exception:
+                pass
+            # mirror into symmetric enemy-intel store for consistency
+            try:
+                if plan_resp.enemy_memory_out.carrier_last_seen is not None:
+                    sess.enemy_intel.carrier = plan_resp.enemy_memory_out.carrier_last_seen
+            except Exception:
+                pass
         logs = list(plan_resp.logs)
         # Apply enemy carrier position move if any
         if plan_resp.carrier_order and plan_resp.carrier_order.type == "move" and plan_resp.carrier_order.target is not None:
             # cross-turn backtrack memory for carrier
-            sess.last_pos_enemy_carrier = (sess.enemy_state.carrier.x, sess.enemy_state.carrier.y)
+            sess.enemy_state.last_pos_carrier = sess.enemy_state.carrier.pos
             aud({
                 "type": "move", "side": "enemy", "unit": "carrier",
-                "from": [sess.enemy_state.carrier.x, sess.enemy_state.carrier.y],
+                "from": [sess.enemy_state.carrier.pos.x, sess.enemy_state.carrier.pos.y],
                 "to": [plan_resp.carrier_order.target.x, plan_resp.carrier_order.target.y],
             })
-            sess.enemy_state.carrier.x = plan_resp.carrier_order.target.x
-            sess.enemy_state.carrier.y = plan_resp.carrier_order.target.y
+            sess.enemy_state.carrier.pos = plan_resp.carrier_order.target
 
         # Apply squadron orders (launch/return/engage)
         for od in (plan_resp.squadron_orders or []):
@@ -222,13 +249,13 @@ class SessionStore:
                 continue
             if od.action == "launch" and od.target is not None and sq.state == "base" and (sq.hp or 0) > 0:
                 tgt = Position(x=od.target.x, y=od.target.y)
-                spawn = _find_free_adjacent(sess, sess.enemy_state.carrier.x, sess.enemy_state.carrier.y, prefer_away_from=tgt)
+                spawn = _find_free_adjacent(sess, sess.enemy_state.carrier.pos, prefer_away_from=tgt)
                 if spawn:
                     aud({
                         "type": "launch", "side": "enemy", "unit": "squadron", "id": sq.id,
                         "spawn": [spawn.x, spawn.y], "target": [tgt.x, tgt.y]
                     })
-                    sq.x, sq.y = spawn.x, spawn.y
+                    sq.pos = spawn
                     sq.target = tgt
                     sq.state = "outbound"
             elif od.action == "return":
@@ -240,7 +267,7 @@ class SessionStore:
                     sq.state = "engaging"
 
         # Apply player orders (carrier move + launch)
-        path_sweep: list[dict] = []
+        path_sweep: list[TrackPos] = []
         audit_events: list[dict] = []
         _apply_player_orders(sess, req, path_sweep, audit_events)
 
@@ -259,18 +286,18 @@ class SessionStore:
 
         # Compute player turn visibility
         turn_visible = _compute_player_visibility(sess, path_sweep)
-        # Update and emit player intel
+        # Update and emit player intel (symmetric intel for player side)
         # keep previous intel snapshot for change detection
-        prev_carrier = sess.player_intel_carrier
-        prev_sq = dict(sess.player_intel_squadrons)
+        prev_carrier = sess.player_intel.carrier
+        prev_sq = dict(sess.player_intel.squadrons)
         player_intel = _update_player_intel(sess, turn_visible)
         # detection events
         if player_intel.carrier and (not prev_carrier or not prev_carrier.seen or prev_carrier.ttl <= 0):
-            aud({"type": "detect", "side": "player", "unit": "enemy_carrier", "pos": [player_intel.carrier.x, player_intel.carrier.y]})
+            aud({"type": "detect", "side": "player", "unit": "enemy_carrier", "pos": [player_intel.carrier.pos.x, player_intel.carrier.pos.y]})
         for item in (player_intel.squadrons or []):
             prev = prev_sq.get(item.id)
             if item.marker and (not prev or not prev.seen or prev.ttl <= 0):
-                aud({"type": "detect", "side": "player", "unit": "enemy_squadron", "id": item.id, "pos": [item.marker.x, item.marker.y]})
+                aud({"type": "detect", "side": "player", "unit": "enemy_squadron", "id": item.id, "pos": [item.marker.pos.x, item.marker.pos.y]})
 
         # flush accumulated audit events
         for ev in audit_events:
@@ -280,17 +307,21 @@ class SessionStore:
         status = _game_status(sess)
 
         return SessionStepResponse(
-            session_id = sess.id,
+            session_id = sess.session_id,
             turn=sess.turn,
             carrier_order=plan_resp.carrier_order,
             squadron_orders=plan_resp.squadron_orders,
             enemy_state=sess.enemy_state,
             player_state=sess.player_state,
             enemy_memory_out=sess.enemy_memory,
-            effects={"player_carrier_damage": max(0, int(dmg_to_player))},
+            effects=StepEffects(player_carrier_damage=max(0, int(dmg_to_player))),
             turn_visible=sorted(list(turn_visible)),
             game_status=status,
             player_intel=player_intel,
+            enemy_intel=PlayerIntel(
+                carrier=sess.enemy_intel.carrier,
+                squadrons=[SquadronIntel(id=sid, marker=m) for sid, m in sess.enemy_intel.squadrons.items() if m.ttl > 0 or m.seen],
+            ),
             logs=logs,
             metrics=plan_resp.metrics,
             request_id=plan_resp.request_id,
@@ -300,82 +331,6 @@ class SessionStore:
 store = SessionStore()
 
 
-# ==== Server-side game helpers (enemy side only) ====
-SQUAD_MAX_HP = 40
-CARRIER_MAX_HP = 100
-VISION_SQUADRON = 5
-VISION_CARRIER = 4
-SQUADRON_RANGE = 22
-
-def _offset_neighbors(x: int, y: int):
-    odd = y & 1
-    if odd:
-        deltas = [(+1, 0), (+1, -1), (0, -1), (-1, 0), (0, +1), (+1, +1)]
-    else:
-        deltas = [(+1, 0), (0, -1), (-1, -1), (-1, 0), (-1, +1), (0, +1)]
-    for dx, dy in deltas:
-        yield x + dx, y + dy
-
-
-def _offset_to_axial(col: int, row: int):
-    q = col - ((row - (row & 1)) >> 1)
-    r = row
-    return q, r
-
-
-def _axial_to_cube(q: int, r: int):
-    x = q
-    z = r
-    y = -x - z
-    return x, y, z
-
-
-def _cube_distance(ax: int, ay: int, az: int, bx: int, by: int, bz: int):
-    return max(abs(ax - bx), abs(ay - by), abs(az - bz))
-
-
-def _hex_distance(x1: int, y1: int, x2: int, y2: int) -> int:
-    aq, ar = _offset_to_axial(x1, y1)
-    bq, br = _offset_to_axial(x2, y2)
-    ax, ay, az = _axial_to_cube(aq, ar)
-    bx, by, bz = _axial_to_cube(bq, br)
-    return _cube_distance(ax, ay, az, bx, by, bz)
-
-
-def is_visible_to_player(sess: Session, x: int, y: int) -> bool:
-    """Return True if tile (x,y) is visible to the player (carrier or active squadrons).
-
-    Mirrors the client-side isVisibleToPlayer implementation.
-    """
-    pc = sess.player_state.carrier
-    if pc and _hex_distance(pc.x, pc.y, x, y) <= getattr(pc, 'vision', VISION_CARRIER):
-        return True
-    for sq in sess.player_state.squadrons:
-        if getattr(sq, 'state', None) in ('base', 'lost'):
-            continue
-        if sq.x is None or sq.y is None:
-            continue
-        if _hex_distance(sq.x, sq.y, x, y) <= getattr(sq, 'vision', VISION_SQUADRON):
-            return True
-    return False
-
-
-def is_visible_to_enemy(sess: Session, x: int, y: int) -> bool:
-    """Return True if tile (x,y) is visible to the enemy (enemy carrier or active enemy squadrons).
-
-    Mirrors the client-side isVisibleToEnemy implementation.
-    """
-    ec = sess.enemy_state.carrier
-    if ec and _hex_distance(ec.x, ec.y, x, y) <= getattr(ec, 'vision', VISION_CARRIER):
-        return True
-    for sq in sess.enemy_state.squadrons:
-        if getattr(sq, 'state', None) in ('base', 'lost'):
-            continue
-        if sq.x is None or sq.y is None:
-            continue
-        if _hex_distance(sq.x, sq.y, x, y) <= getattr(sq, 'vision', VISION_SQUADRON):
-            return True
-    return False
 
 
 def _compute_visible_player_squadrons(sess: Session) -> PlayerObservation:
@@ -386,19 +341,17 @@ def _compute_visible_player_squadrons(sess: Session) -> PlayerObservation:
     """
     visible = []
     for ps in sess.player_state.squadrons:
-        if getattr(ps, 'state', None) in ('base', 'lost'):
+        if not ps.is_active():
             continue
-        if ps.x is None or ps.y is None:
-            continue
-        if is_visible_to_enemy(sess, ps.x, ps.y):
-            visible.append(SquadronLight(id=ps.id, x=ps.x, y=ps.y))
+        if sess.enemy_state.is_visible_to_player(ps):
+            visible.append(SquadronLight(id=ps.id, pos=ps.pos))
     return PlayerObservation(visible_squadrons=visible)
 
 
 
 def _distance_field_hex(
     sess: Session,
-    goal: tuple,
+    goal: Position,
     *,
     pass_islands: bool,
     ignore_id: Optional[str] = None,
@@ -412,7 +365,7 @@ def _distance_field_hex(
     Returns a 2D list of distances (cells with INF are unreachable). If the
     map is empty, returns None.
     """
-    gx, gy = goal
+
     W = len(sess.map[0]) if sess.map else 0
     H = len(sess.map)
     if W == 0 or H == 0:
@@ -421,62 +374,61 @@ def _distance_field_hex(
     INF = 10 ** 9
     dist = [[INF for _ in range(W)] for __ in range(H)]
 
-    def in_bounds(x, y):
-        return 0 <= x < W and 0 <= y < H
-
-    def passable(x, y):
-        if not in_bounds(x, y):
+    def passable(pos:Position):
+        if not pos.in_bounds(W,H):
             return False
-        if not pass_islands and sess.map[y][x] != 0:
+        if not pass_islands and sess.map[pos.y][pos.x] != 0:
             return False
-        if avoid_prev_pos is not None and (x, y) == avoid_prev_pos:
+        if avoid_prev_pos is not None and pos == avoid_prev_pos:
             return False
-        if consider_occupied and _is_occupied(sess, x, y, ignore_id=ignore_id, player_obs=player_obs):
+        if consider_occupied and _is_occupied(sess, pos, ignore_id=ignore_id, player_obs=player_obs):
             return False
         return True
 
-    q = deque()
+    gx, gy = goal.x, goal.y
+    q: deque[Position] = deque()
     # Seeds: goal within stop_range; for exact stop, only the goal itself
     R = max(0, int(stop_range))
     for y in range(max(0, gy - (R + 2)), min(H, gy + (R + 3))):
         for x in range(max(0, gx - (R + 2)), min(W, gx + (R + 3))):
-            if _hex_distance(x, y, gx, gy) <= R and passable(x, y):
+            xy = Position.new(x, y)
+            if goal.hex_distance(xy) <= R and passable(xy):
                 dist[y][x] = 0
-                q.append((x, y))
+                q.append(xy)
 
     if not q:
         # If goal seed cells are not passable (e.g., occupied), still allow building distances but unreachable will remain INF
-        if passable(gx, gy):
-            dist[gy][gx] = 0
-            q.append((gx, gy))
+        if passable(goal):
+            dist[goal.y][goal.x] = 0
+            q.append(goal)
         else:
             return dist
 
     # Proper BFS to fill the distance field
     while q:
-        cx, cy = q.popleft()
-        cd = dist[cy][cx]
-        for nx, ny in _offset_neighbors(cx, cy):
-            if not passable(nx, ny):
+        cp = q.popleft()
+        cd = dist[cp.y][cp.x]
+        for np in cp.offset_neighbors():
+            if not passable(np):
                 continue
             nd = cd + 1
-            if dist[ny][nx] > nd:
-                dist[ny][nx] = nd
-                q.append((nx, ny))
+            if dist[np.y][np.x] > nd:
+                dist[np.y][np.x] = nd
+                q.append(np)
     return dist
 
 
 def _gradient_full_path(
     sess: Session,
-    start: tuple,
-    goal: tuple,
+    start: Position,
+    goal: Position,
     *,
     pass_islands: bool,
     stop_range: int = 0,
     max_steps: int = 5000,
-):
+) -> list[Position]:
     """Construct full gradient-descent path from start to goal using a wavefront distance field.
-    Returns list of (x,y) including start and final cell (distance 0 or no-progress).
+    Returns list of positions including start and the last progressed cell (or start if blocked).
     """
     dist = _distance_field_hex(
         sess,
@@ -492,8 +444,8 @@ def _gradient_full_path(
         return [start]
     W = len(sess.map[0]) if sess.map else 0
     H = len(sess.map)
-    x, y = start
-    path = [start]
+    x, y = start.x, start.y
+    path: list[Position] = [start]
     steps = 0
     INF = 10 ** 9
     while steps < max_steps:
@@ -502,16 +454,18 @@ def _gradient_full_path(
         dcur = dist[y][x]
         if dcur <= max(0, stop_range) or dcur >= INF:
             break
-        nbrs = []
-        for nx, ny in _offset_neighbors(x, y):
-            if 0 <= nx < W and 0 <= ny < H:
-                nbrs.append((dist[ny][nx], nx, ny))
+        # Use current position (x,y) to examine neighbors
+        cpos = Position(x=x, y=y)
+        nbrs: list[tuple[int, Position]] = []
+        for npos in cpos.offset_neighbors():
+            if 0 <= npos.x < W and 0 <= npos.y < H:
+                nbrs.append((dist[npos.y][npos.x], npos))
         nbrs.sort(key=lambda t: t[0])
         moved = False
-        for dv, nx, ny in nbrs:
+        for dv, npos in nbrs:
             if dv < dcur:
-                x, y = nx, ny
-                path.append((x, y))
+                path.append(npos)
+                x, y = npos.x, npos.y
                 moved = True
                 break
         if not moved:
@@ -522,16 +476,16 @@ def _gradient_full_path(
 
 def _find_path_hex(
     sess: Session,
-    start: tuple,
-    goal: tuple,
+    start: Position,
+    goal: Position,
     *,
     pass_islands: bool,
     ignore_id: Optional[str] = None,
     player_obs=None,
     stop_range: int = 0,
-    avoid_prev_pos: Optional[tuple] = None,
+    avoid_prev_pos: Optional[Position] = None,
     max_expand: int = 4000,
-):
+) -> list[Position]|None:
     """A* pathfinding on hex grid (offset coords), returns list of (x,y) including start->end.
 
     - Treat islands as impassable when pass_islands is False; otherwise ignore terrain.
@@ -539,8 +493,6 @@ def _find_path_hex(
     - Goal is any cell with hex_distance(cell, goal) <= stop_range; if stop_range==0 it's exact match.
     - avoid_prev_pos: optional single cell to exclude as first step (helps avoid immediate backtracking across turns).
     """
-    sx, sy = start
-    gx, gy = goal
     W = len(sess.map[0]) if sess.map else 0
     H = len(sess.map)
     if W == 0 or H == 0:
@@ -549,101 +501,126 @@ def _find_path_hex(
     def in_bounds(x, y):
         return 0 <= x < W and 0 <= y < H
 
-    def passable(x, y):
-        if not in_bounds(x, y):
+    def passable(pos:Position):
+        if not in_bounds(pos.x, pos.y):
             return False
-        if not pass_islands and sess.map[y][x] != 0:
+        if not pass_islands and sess.map[pos.y][pos.x] != 0:
             return False
-        if avoid_prev_pos is not None and (x, y) == avoid_prev_pos:
+        if avoid_prev_pos is not None and pos == avoid_prev_pos:
             return False
-        if _is_occupied(sess, x, y, ignore_id=ignore_id, player_obs=player_obs):
+        if _is_occupied(sess, pos, ignore_id=ignore_id, player_obs=player_obs):
             return False
         return True
 
-    start_ok = passable(sx, sy)
+    start_ok = passable(start)
     if not start_ok:
         # If starting on non-passable (shouldn't happen), return None
         return None
 
     # Early exit if already at goal within stop_range
-    if _hex_distance(sx, sy, gx, gy) <= max(0, stop_range):
+    if start.hex_distance(goal) <= max(0, stop_range):
         return [start]
 
-    open_heap = []  # (f, g, (x,y))
-    heapq.heappush(open_heap, (0 + _hex_distance(sx, sy, gx, gy), 0, (sx, sy)))
-    came_from = { (sx, sy): None }
-    g_score = { (sx, sy): 0 }
-    closed = set()
+    open_heap:list[tuple[int,int,Position]] = []  # (f, g, (x,y))
+    heapq.heappush(open_heap, (0 + start.hex_distance(goal), 0, start))
+    came_from:dict[Position,Position|None] = { start: None }
+    g_score:dict[Position,int] = { start: 0 }
+    closed:set[Position] = set()
     expands = 0
 
     while open_heap and expands < max_expand:
-        f, g, (cx, cy) = heapq.heappop(open_heap)
-        if (cx, cy) in closed:
+        f, g, pos = heapq.heappop(open_heap)
+        if pos in closed:
             continue
-        closed.add((cx, cy))
+        closed.add(pos)
         expands += 1
         # goal test: within stop_range
-        if _hex_distance(cx, cy, gx, gy) <= max(0, stop_range):
+        if pos.hex_distance(goal) <= max(0, stop_range):
             # Reconstruct path
-            path = [(cx, cy)]
-            cur = (cx, cy)
-            while came_from[cur] is not None:
+            path:list[Position] = [pos]
+            cur = pos
+            while cur and came_from[cur] is not None:
                 cur = came_from[cur]
-                path.append(cur)
+                if cur:
+                    path.append(cur)
             path.reverse()
             return path
         # expand neighbors
-        for nx, ny in _offset_neighbors(cx, cy):
-            if not passable(nx, ny):
+        for npos in pos.offset_neighbors():
+            if not passable(npos):
                 continue
             tentative = g + 1
-            if tentative < g_score.get((nx, ny), 1e9):
-                g_score[(nx, ny)] = tentative
-                came_from[(nx, ny)] = (cx, cy)
-                h = _hex_distance(nx, ny, gx, gy)
-                heapq.heappush(open_heap, (tentative + h, tentative, (nx, ny)))
+            if tentative < g_score.get(npos, 1e9):
+                g_score[npos] = tentative
+                came_from[npos] = pos
+                h = npos.hex_distance(goal)
+                heapq.heappush(open_heap, (tentative + h, tentative, npos))
 
     return None
 
 
-def _is_occupied(sess: Session, x: int, y: int, ignore_id: Optional[str] = None, player_obs: Optional[PlayerObservation] = None) -> bool:
+def _is_occupied(sess: Session, pos:Position, ignore_id: Optional[str] = None, player_obs: Optional[PlayerObservation] = None) -> bool:
     # enemy carrier
-    if sess.enemy_state.carrier.x == x and sess.enemy_state.carrier.y == y:
+    if sess.enemy_state.carrier.pos == pos:
         return True
     # player carrier
-    if sess.player_state.carrier.x == x and sess.player_state.carrier.y == y:
+    if sess.player_state.carrier.pos == pos:
         return True
     # enemy squadrons
     for s in sess.enemy_state.squadrons:
         if s.id == ignore_id:
             continue
-        if s.x == x and s.y == y and s.state not in ("base", "lost"):
+        if s.pos == pos and s.state not in ("base", "lost"):
             return True
     # visible player squadrons (avoid)
     if player_obs and player_obs.visible_squadrons:
         for ps in player_obs.visible_squadrons:
-            if ps.x == x and ps.y == y:
+            if ps.pos == pos:
                 return True
     return False
 
 
-def _find_free_adjacent(sess: Session, cx: int, cy: int, prefer_away_from: Optional[Position] = None):
-    candidates = []
-    for nx, ny in _offset_neighbors(cx, cy):
-        if ny < 0 or nx < 0 or ny >= len(sess.map) or nx >= len(sess.map[0]):
+def _find_free_adjacent(sess: Session, pos: Position, prefer_away_from: Optional[Position] = None):
+    candidates: list[Position] = []
+    for npos in pos.offset_neighbors():
+        if npos.y < 0 or npos.x < 0 or npos.y >= len(sess.map) or npos.x >= len(sess.map[0]):
             continue
-        if sess.map[ny][nx] != 0:
+        if sess.map[npos.y][npos.x] != 0:
             continue
-        if _is_occupied(sess, nx, ny):
+        if _is_occupied(sess, npos):
             continue
-        candidates.append((nx, ny))
+        candidates.append(npos)
     if not candidates:
         return None
     if prefer_away_from is not None:
         # sort by descending distance from prefer_away_from
-        candidates.sort(key=lambda p: _hex_distance(prefer_away_from.x, prefer_away_from.y, p[0], p[1]), reverse=True)
-    nx, ny = candidates[0]
-    return Position(x=nx, y=ny)
+        candidates.sort(key=lambda p: prefer_away_from.hex_distance(p), reverse=True)
+    return candidates[0]
+
+
+def _nearest_sea_tile(sess: Session, pos: Position) -> Optional[Position]:
+    """Find nearest sea tile (map==0) to the given position using BFS over hex neighbors.
+    Returns a Position or None if map is empty.
+    """
+    H = len(sess.map)
+    W = len(sess.map[0]) if H > 0 else 0
+    if W == 0 or H == 0:
+        return None
+    from collections import deque
+    start = Position.new(pos)
+    q: deque[Position] = deque([start])
+    visited: set[Position] = { start }
+    while q:
+        p = q.popleft()
+        if 0 <= p.x < W and 0 <= p.y < H:
+            if sess.map[p.y][p.x] == 0:
+                return p
+            for n in p.offset_neighbors():
+                if 0 <= n.x < W and 0 <= n.y < H and n not in visited:
+                    visited.add(n)
+                    q.append(n)
+    return None
+
 
 
 def _scaled_damage(attacker_hp: Optional[int], base: int) -> int:
@@ -664,22 +641,24 @@ def _scaled_aa(player_hp: Optional[int], base: int) -> int:
 
 def _step_on_grid_towards(
     sess: Session,
-    obj: dict,
-    target: dict,
+    obj: Position,
+    is_pass_islands:bool,
+    target: Position,
     step_max: int,
     stop_range: int = 0,
     ignore_id: Optional[str] = None,
     player_obs: Optional[PlayerObservation] = None,
-    track_path: Optional[list] = None,
+    track_path: Optional[list[TrackPos]] = None,
     track_range: int = 0,
     debug_trace: Optional[list] = None,
-    avoid_prev_pos: Optional[tuple] = None,
-):
+    avoid_prev_pos: Optional[Position] = None,
+)-> Position:
+
     # First compute wavefront distance field from target (goal) and follow gradient
     dist = _distance_field_hex(
         sess,
-        (target['x'], target['y']),
-        pass_islands=bool(obj.get('pass_islands')),
+        target,
+        pass_islands=is_pass_islands,
         ignore_id=ignore_id,
         player_obs=player_obs,
         stop_range=stop_range,
@@ -689,180 +668,181 @@ def _step_on_grid_towards(
     if dist is None:
         if debug_trace is not None:
             debug_trace.append({"reason": "unreachable_no_field"})
-        return
+        return obj
     if dist is not None:
         W = len(sess.map[0]) if sess.map else 0
         H = len(sess.map)
         INF = 10**9
         steps = 0
+        cur = obj
         while steps < step_max:
-            cx, cy = obj['x'], obj['y']
-            if not (0 <= cx < W and 0 <= cy < H):
+            cx, cy = cur.x, cur.y
+            if not cur.in_bounds(W,H):
                 break
             dcur = dist[cy][cx] if dist else INF
             if dcur == 0 or dcur >= INF:
                 break
             # choose neighbor with minimal distance < dcur
-            candidates = []
-            for nx, ny in _offset_neighbors(cx, cy):
-                if 0 <= nx < W and 0 <= ny < H:
-                    candidates.append((dist[ny][nx], nx, ny))
+            candidates:list[tuple[int,Position]] = []
+            for npos in cur.offset_neighbors():
+                if npos.in_bounds(W,H):
+                    candidates.append((dist[npos.y][npos.x], npos))
             candidates.sort(key=lambda t: t[0])
             moved = False
-            for dv, nx, ny in candidates:
+            for dv, npos in candidates:
                 if dv < dcur:
-                    prev_x, prev_y = obj['x'], obj['y']
-                    obj['x'], obj['y'] = nx, ny
+                    prev_pos = cur
+                    cur = npos
                     if track_path is not None and track_range > 0:
-                        track_path.append({'x': nx, 'y': ny, 'range': track_range})
+                        track_path.append( TrackPos(x=npos.x, y=npos.y, range=track_range))
                     if debug_trace is not None:
-                        debug_trace.append({"from": [prev_x, prev_y], "to": [nx, ny], "solver": "wavefront"})
+                        debug_trace.append({"from": [prev_pos.x, prev_pos.y], "to": [npos.x, npos.y], "solver": "wavefront"})
                     moved = True
                     steps += 1
                     break
             if not moved:
                 break
         # Always return after wavefront attempt; do not use greedy fallback
-        return
+        return cur
 
     # Greedy fallback when A* fails (should be rare):
-    last_x: Optional[int] = None
-    last_y: Optional[int] = None
-    visited = set()
+    last_pos: Optional[Position] = None
+    visited:set[Position] = set()
     for _ in range(step_max):
-        dist = _hex_distance(obj['x'], obj['y'], target['x'], target['y'])
+        dist = obj.hex_distance(target)
         if dist <= stop_range:
             break
         # next along hex line: approximate by choosing neighbor minimizing distance
-        curx, cury = obj['x'], obj['y']
-        visited.add((curx, cury))
-        nbrs = [(nx, ny) for nx, ny in _offset_neighbors(curx, cury)]
+        cur_pos = obj
+        visited.add((cur_pos))
+        nbrs = [p for p in cur_pos.offset_neighbors()]
         # prefer those that are closer to target
-        nbrs.sort(key=lambda p: _hex_distance(p[0], p[1], target['x'], target['y']))
+        nbrs.sort(key=lambda p: p.hex_distance(target))
         moved = False
         # 1) strictly better moves, skipping occupied and (for carriers) islands
-        for nx, ny in nbrs:
-            if ny < 0 or nx < 0 or ny >= len(sess.map) or nx >= len(sess.map[0]):
+        for npos in nbrs:
+            if npos.y < 0 or npos.x < 0 or npos.y >= len(sess.map) or npos.x >= len(sess.map[0]):
                 continue
-            if not obj.get('pass_islands'):
-                if sess.map[ny][nx] != 0:
+            if not is_pass_islands:
+                if sess.map[npos.y][npos.x] != 0:
                     continue
-            if (nx, ny) in visited or (avoid_prev_pos is not None and (nx, ny) == avoid_prev_pos):
+            if npos in visited or (avoid_prev_pos is not None and npos == avoid_prev_pos):
                 continue
-            if _is_occupied(sess, nx, ny, ignore_id=ignore_id, player_obs=player_obs):
+            if _is_occupied(sess, npos, ignore_id=ignore_id, player_obs=player_obs):
                 continue
-            if _hex_distance(nx, ny, target['x'], target['y']) < dist:
+            if npos.hex_distance(target) < dist:
                 # avoid immediate backtrack
-                if last_x is not None and nx == last_x and last_y is not None and ny == last_y:
+                if last_pos is not None and npos ==last_pos:
                     continue
-                prev_x, prev_y = obj['x'], obj['y']
-                obj['x'], obj['y'] = nx, ny
+                prev_pos = obj
+                obj = npos
                 if track_path is not None and track_range > 0:
-                    track_path.append({'x': nx, 'y': ny, 'range': track_range})
+                    track_path.append(TrackPos(x=npos.x,y=npos.y,range=track_range))
                 if debug_trace is not None:
-                    debug_trace.append({"from": [prev_x, prev_y], "to": [nx, ny], "terrain": ("island" if sess.map[ny][nx] != 0 else "sea")})
+                    debug_trace.append({"from": [prev_pos.x, prev_pos.y], "to": [npos.x, npos.y], "terrain": ("island" if sess.map[npos.y][npos.x] != 0 else "sea")})
                 moved = True
-                last_x, last_y = prev_x, prev_y
+                last_pos = prev_pos
                 break
         if moved:
             continue
         # 2) equal-distance sidestep, but avoid immediate backtracking
-        for nx, ny in nbrs:
-            if ny < 0 or nx < 0 or ny >= len(sess.map) or nx >= len(sess.map[0]):
+        for npos in nbrs:
+            if npos.y < 0 or npos.x < 0 or npos.y >= len(sess.map) or npos.x >= len(sess.map[0]):
                 continue
-            if not obj.get('pass_islands'):
-                if sess.map[ny][nx] != 0:
+            if not is_pass_islands:
+                if sess.map[npos.y][npos.x] != 0:
                     continue
-            if (nx, ny) in visited or (avoid_prev_pos is not None and (nx, ny) == avoid_prev_pos):
+            if npos in visited or (avoid_prev_pos is not None and npos == avoid_prev_pos):
                 continue
-            if _is_occupied(sess, nx, ny, ignore_id=ignore_id, player_obs=player_obs):
+            if _is_occupied(sess, npos, ignore_id=ignore_id, player_obs=player_obs):
                 continue
-            if _hex_distance(nx, ny, target['x'], target['y']) == dist:
+            if npos.hex_distance(target) == dist:
                 # don't step back to the tile we just came from in previous step
-                if last_x is not None and nx == last_x and last_y is not None and ny == last_y:
+                if last_pos is not None and npos == last_pos:
                     continue
-                prev_x, prev_y = obj['x'], obj['y']
-                obj['x'], obj['y'] = nx, ny
+                prev_pos = obj
+                obj = npos
                 if track_path is not None and track_range > 0:
-                    track_path.append({'x': nx, 'y': ny, 'range': track_range})
+                    track_path.append(TrackPos(x=npos.x,y=npos.y,range=track_range))
                 if debug_trace is not None:
-                    debug_trace.append({"from": [prev_x, prev_y], "to": [nx, ny], "terrain": ("island" if sess.map[ny][nx] != 0 else "sea")})
+                    debug_trace.append({"from": [prev_pos.x, prev_pos.y], "to": [npos.x, npos.y], "terrain": ("island" if sess.map[npos.y][npos.x] != 0 else "sea")})
                 moved = True
-                last_x, last_y = prev_x, prev_y
+                last_pos = prev_pos
                 break
         if moved:
             continue
         # 3) last-resort: allow minimal distance increase to route around obstacles
-        best = None
-        best_d = None
-        for nx, ny in nbrs:
-            if ny < 0 or nx < 0 or ny >= len(sess.map) or nx >= len(sess.map[0]):
+        best: Position|None = None
+        best_d: int|None = None
+        for npos in nbrs:
+            if npos.y < 0 or npos.x < 0 or npos.y >= len(sess.map) or npos.x >= len(sess.map[0]):
                 continue
-            if not obj.get('pass_islands'):
-                if sess.map[ny][nx] != 0:
+            if not is_pass_islands:
+                if sess.map[npos.y][npos.x] != 0:
                     continue
-            if (nx, ny) in visited or (avoid_prev_pos is not None and (nx, ny) == avoid_prev_pos):
+            if npos in visited or (avoid_prev_pos is not None and npos == avoid_prev_pos):
                 continue
-            if _is_occupied(sess, nx, ny, ignore_id=ignore_id, player_obs=player_obs):
+            if _is_occupied(sess, npos, ignore_id=ignore_id, player_obs=player_obs):
                 continue
-            nd = _hex_distance(nx, ny, target['x'], target['y'])
+            nd = npos.hex_distance(target)
             # avoid immediate backtrack
-            if last_x is not None and nx == last_x and last_y is not None and ny == last_y:
+            if last_pos is not None and npos == last_pos:
                 continue
             if best_d is None or nd < best_d:
                 best_d = nd
-                best = (nx, ny)
+                best = npos
         if best is not None and best_d is not None and best_d <= dist + 2:
-            prev_x, prev_y = obj['x'], obj['y']
-            obj['x'], obj['y'] = best
+            prev_pos = obj
+            obj = best
             if track_path is not None and track_range > 0:
-                track_path.append({'x': best[0], 'y': best[1], 'range': track_range})
+                track_path.append(TrackPos(x=best.x,y=best.y,range=track_range))
             if debug_trace is not None:
-                by, bx = best[1], best[0]
-                debug_trace.append({"from": [prev_x, prev_y], "to": [best[0], best[1]], "mode": "fallback", "terrain": ("island" if sess.map[by][bx] != 0 else "sea")})
+                debug_trace.append({"from": [prev_pos.x, prev_pos.y], "to": [best.x, best.y], "mode": "fallback", "terrain": ("island" if sess.map[best.y][best.x] != 0 else "sea")})
             moved = True
-            last_x, last_y = prev_x, prev_y
+            last_pos = prev_pos
             continue
-        for nx, ny in nbrs:
-            if ny < 0 or nx < 0 or ny >= len(sess.map) or nx >= len(sess.map[0]):
+        for npos in nbrs:
+            if npos.y < 0 or npos.x < 0 or npos.y >= len(sess.map) or npos.x >= len(sess.map[0]):
                 continue
             # aircraft can pass islands; carriers cannot (we treat based on a flag on obj)
-            if _is_occupied(sess, nx, ny, ignore_id=ignore_id, player_obs=player_obs):
+            if _is_occupied(sess, npos, ignore_id=ignore_id, player_obs=player_obs):
                 continue
             # forbid islands for carriers (obj.get('pass_islands') falsy)
-            if not obj.get('pass_islands'):
-                if ny < 0 or nx < 0 or ny >= len(sess.map) or nx >= len(sess.map[0]):
+            if not is_pass_islands:
+                if npos.y < 0 or npos.x < 0 or npos.y >= len(sess.map) or npos.x >= len(sess.map[0]):
                     continue
-                if sess.map[ny][nx] != 0:
+                if sess.map[npos.y][npos.x] != 0:
                     continue
             # already tried better and equal moves; nothing else reduces distance, so stop
         if not moved:
             if debug_trace is not None:
-                debug_trace.append({"from": [obj['x'], obj['y']], "reason": "blocked_or_not_improving"})
+                debug_trace.append({"from": [obj.x, obj.y], "reason": "blocked_or_not_improving"})
             break
+    return obj
 
 
 def _progress_enemy_squadrons(sess: Session, player_observation: PlayerObservation, audit_events: Optional[list] = None) -> int:
     total_player_damage = 0
     ec = sess.enemy_state.carrier
+    is_pass_islands = True
     # shallow copy for safe iteration
     for sq in list(sess.enemy_state.squadrons):
-        prev_pos = (sq.x, sq.y) if sq.x is not None and sq.y is not None else None
+        prev_pos: Position|None = sq.pos if sq.is_active() else None
         if sq.state == "outbound":
             # If player carrier visible (server-calculated), move toward it and possibly attack
             server_vis = _enemy_sees_player_carrier(sess)
             if server_vis is not None:
                 # move toward player carrier with stopRange 1
-                obj = {'x': sq.x, 'y': sq.y, 'pass_islands': True}
-                tgt = {'x': server_vis.x, 'y': server_vis.y}
+                obj = sq.pos # {'x': sq.pos.x, 'y': sq.pos.y, 'pass_islands': True}
+                tgt = server_vis
                 trace = []
-                avoid_prev = sess.last_pos_enemy_sq.get(sq.id) if prev_pos is not None else None
-                _step_on_grid_towards(sess, obj, tgt, getattr(sq, 'speed', 10) or 10, stop_range=1, ignore_id=sq.id, player_obs=player_observation, debug_trace=trace, avoid_prev_pos=avoid_prev)
-                sq.x, sq.y = obj['x'], obj['y']
+                avoid_prev = sess.enemy_state.last_pos_squadrons.get(sq.id) if prev_pos is not None else None
+                obj_new = _step_on_grid_towards(sess, obj, is_pass_islands, tgt, sq.speed, stop_range=1, ignore_id=sq.id, player_obs=player_observation, debug_trace=trace, avoid_prev_pos=avoid_prev)
+                sq.pos = obj_new
                 if audit_events is not None:
-                    audit_events.append({"type": "move", "side": "enemy", "unit": "squadron", "id": sq.id, "from": [sq.x, sq.y], "target": [tgt['x'], tgt['y']], "trace": trace})
-                if _hex_distance(sq.x, sq.y, tgt['x'], tgt['y']) <= 1:
-                    dmg = _scaled_damage(getattr(sq, 'hp', SQUAD_MAX_HP), 25)
+                    audit_events.append({"type": "move", "side": "enemy", "unit": "squadron", "id": sq.id, "from": [sq.pos.x, sq.pos.y], "target": [tgt.x, tgt.y], "trace": trace})
+                if sq.hex_distance(tgt) <= 1:
+                    dmg = _scaled_damage(sq.hp, 25)
                     total_player_damage += dmg
                     # AA against squadron
                     aa = _scaled_aa(sess.player_state.carrier.hp if (sess.player_state and sess.player_state.carrier and sess.player_state.carrier.hp is not None) else CARRIER_MAX_HP, 20)
@@ -871,8 +851,7 @@ def _progress_enemy_squadrons(sess: Session, player_observation: PlayerObservati
                         audit_events.append({"type": "attack", "side": "enemy", "unit": "squadron", "id": sq.id, "damage": dmg, "aa": aa, "unit_hp_after": sq.hp})
                     if sq.hp <= 0:
                         sq.state = "lost"
-                        sq.x = None
-                        sq.y = None
+                        sq.pos = Position.invalid()
                         sq.target = None
                     else:
                         sq.state = "returning"
@@ -881,29 +860,29 @@ def _progress_enemy_squadrons(sess: Session, player_observation: PlayerObservati
             else:
                 # not visible: continue toward target (if any)
                 if sq.target is not None:
-                    obj = {'x': sq.x, 'y': sq.y, 'pass_islands': True}
-                    tgt = {'x': sq.target.x, 'y': sq.target.y}
+                    obj = sq.pos
+                    tgt = sq.target
                     trace = []
-                    avoid_prev = sess.last_pos_enemy_sq.get(sq.id) if prev_pos is not None else None
-                    _step_on_grid_towards(sess, obj, tgt, getattr(sq, 'speed', 10) or 10, ignore_id=sq.id, player_obs=player_observation, debug_trace=trace, avoid_prev_pos=avoid_prev)
-                    sq.x, sq.y = obj['x'], obj['y']
+                    avoid_prev = sess.enemy_state.last_pos_squadrons.get(sq.id) if prev_pos is not None else None
+                    obj_new = _step_on_grid_towards(sess, obj, is_pass_islands, tgt,sq.speed, ignore_id=sq.id, player_obs=player_observation, debug_trace=trace, avoid_prev_pos=avoid_prev)
+                    sq.pos = obj_new
                     if audit_events is not None:
-                        audit_events.append({"type": "move", "side": "enemy", "unit": "squadron", "id": sq.id, "from": [sq.x, sq.y], "target": [tgt['x'], tgt['y']], "trace": trace})
-                    if sq.x == sq.target.x and sq.y == sq.target.y:
+                        audit_events.append({"type": "move", "side": "enemy", "unit": "squadron", "id": sq.id, "from": [sq.pos.x, sq.pos.y], "target": [tgt.x, tgt.y], "trace": trace})
+                    if sq.pos == sq.target:
                         sq.state = "returning"
         elif sq.state == "engaging":
             server_vis = _enemy_sees_player_carrier(sess)
             if server_vis is not None:
-                obj = {'x': sq.x, 'y': sq.y, 'pass_islands': True}
-                tgt = {'x': server_vis.x, 'y': server_vis.y}
+                obj = sq.pos
+                tgt = server_vis
                 trace = []
-                avoid_prev = sess.last_pos_enemy_sq.get(sq.id) if prev_pos is not None else None
-                _step_on_grid_towards(sess, obj, tgt, getattr(sq, 'speed', 10) or 10, stop_range=1, ignore_id=sq.id, player_obs=player_observation, debug_trace=trace, avoid_prev_pos=avoid_prev)
-                sq.x, sq.y = obj['x'], obj['y']
+                avoid_prev = sess.enemy_state.last_pos_squadrons.get(sq.id) if prev_pos is not None else None
+                obj_new = _step_on_grid_towards(sess, obj, is_pass_islands,tgt,sq.speed, stop_range=1, ignore_id=sq.id, player_obs=player_observation, debug_trace=trace, avoid_prev_pos=avoid_prev)
+                sq.pos = obj_new
                 if audit_events is not None:
-                    audit_events.append({"type": "move", "side": "enemy", "unit": "squadron", "id": sq.id, "from": [sq.x, sq.y], "target": [tgt['x'], tgt['y']], "trace": trace})
-                if _hex_distance(sq.x, sq.y, tgt['x'], tgt['y']) <= 1:
-                    dmg = _scaled_damage(getattr(sq, 'hp', SQUAD_MAX_HP), 25)
+                    audit_events.append({"type": "move", "side": "enemy", "unit": "squadron", "id": sq.id, "from": [sq.pos.x, sq.pos.y], "target": [tgt.x, tgt.y], "trace": trace})
+                if sq.hex_distance(tgt) <= 1:
+                    dmg = _scaled_damage(sq.hp, 25)
                     total_player_damage += dmg
                     aa = _scaled_aa(sess.player_state.carrier.hp if (sess.player_state and sess.player_state.carrier and sess.player_state.carrier.hp is not None) else CARRIER_MAX_HP, 20)
                     sq.hp = max(0, (sq.hp or SQUAD_MAX_HP) - aa)
@@ -911,197 +890,235 @@ def _progress_enemy_squadrons(sess: Session, player_observation: PlayerObservati
                         audit_events.append({"type": "attack", "side": "enemy", "unit": "squadron", "id": sq.id, "damage": dmg, "aa": aa, "unit_hp_after": sq.hp})
                     if sq.hp <= 0:
                         sq.state = "lost"
-                        sq.x = None
-                        sq.y = None
+                        sq.pos = Position.invalid()
                         sq.target = None
                     else:
                         sq.state = "returning"
         elif sq.state == "returning":
-            obj = {'x': sq.x, 'y': sq.y, 'pass_islands': True}
-            tgt = {'x': ec.x, 'y': ec.y}
+            obj = sq.pos
+            tgt = ec.pos
             trace = []
-            avoid_prev = sess.last_pos_enemy_sq.get(sq.id) if prev_pos is not None else None
-            _step_on_grid_towards(sess, obj, tgt, getattr(sq, 'speed', 10) or 10, stop_range=1, ignore_id=sq.id, player_obs=player_observation, debug_trace=trace, avoid_prev_pos=avoid_prev)
-            sq.x, sq.y = obj['x'], obj['y']
+            avoid_prev = sess.enemy_state.last_pos_squadrons.get(sq.id) if prev_pos is not None else None
+            obj_new = _step_on_grid_towards(sess, obj, is_pass_islands, tgt,sq.speed, stop_range=1, ignore_id=sq.id, player_obs=player_observation, debug_trace=trace, avoid_prev_pos=avoid_prev)
+            sq.pos = obj_new
             if audit_events is not None:
-                audit_events.append({"type": "move", "side": "enemy", "unit": "squadron", "id": sq.id, "from": [sq.x, sq.y], "target": [tgt['x'], tgt['y']], "trace": trace})
-            if _hex_distance(sq.x, sq.y, ec.x, ec.y) <= 1:
+                audit_events.append({"type": "move", "side": "enemy", "unit": "squadron", "id": sq.id, "from": [sq.pos.x, sq.pos.y], "target": [tgt.x, tgt.y], "trace": trace})
+            if sq.hex_distance(ec) <= 1:
                 sq.state = "base"
-                sq.x = None
-                sq.y = None
+                sq.pos = Position.invalid()
                 sq.target = None
         # update last pos for next turn avoidance
         if prev_pos is not None:
-            sess.last_pos_enemy_sq[sq.id] = prev_pos
+            sess.enemy_state.last_pos_squadrons[sq.id] = prev_pos
     return total_player_damage
 
 
-def _progress_player_squadrons(sess: Session, path_sweep: Optional[list] = None, audit_events: Optional[list] = None) -> int:
+def _progress_player_squadrons(sess: Session, path_sweep: Optional[list[TrackPos]] = None, audit_events: Optional[list] = None) -> int:
     total_enemy_damage = 0
     pc = sess.player_state.carrier
     ec = sess.enemy_state.carrier
+    is_pass_islands = True
     for sq in list(sess.player_state.squadrons):
-        prev_pos = (sq.x, sq.y) if sq.x is not None and sq.y is not None else None
+        prev_pos = sq.pos if sq.is_active() else None
         if sq.state == "outbound":
             # If enemy carrier within vision, move to engage
-            if _hex_distance(sq.x, sq.y, ec.x, ec.y) <= getattr(sq, 'vision', VISION_SQUADRON) or getattr(sq, 'vision', VISION_SQUADRON) >= _hex_distance(sq.x, sq.y, ec.x, ec.y):
-                obj = {'x': sq.x, 'y': sq.y, 'pass_islands': True}
-                tgt = {'x': ec.x, 'y': ec.y}
+            if sq.hex_distance(ec) <= sq.vision:
+                obj = sq.pos
+                tgt = ec.pos
                 trace = []
-                avoid_prev = sess.last_pos_player_sq.get(sq.id) if prev_pos is not None else None
-                _step_on_grid_towards(sess, obj, tgt, getattr(sq, 'speed', 10) or 10, stop_range=1, ignore_id=sq.id, track_path=path_sweep, track_range=getattr(sq, 'vision', VISION_SQUADRON) or VISION_SQUADRON, debug_trace=trace, avoid_prev_pos=avoid_prev)
-                sq.x, sq.y = obj['x'], obj['y']
+                avoid_prev = sess.player_state.last_pos_squadrons.get(sq.id) if prev_pos is not None else None
+                obj_new = _step_on_grid_towards(sess, obj, is_pass_islands, tgt,sq.speed, stop_range=1, ignore_id=sq.id, track_path=path_sweep, track_range=sq.vision or VISION_SQUADRON, debug_trace=trace, avoid_prev_pos=avoid_prev)
+                sq.pos = obj_new
                 if audit_events is not None:
-                    audit_events.append({"type": "move", "side": "player", "unit": "squadron", "id": sq.id, "from": [sq.x, sq.y], "target": [tgt['x'], tgt['y']], "trace": trace})
-                if _hex_distance(sq.x, sq.y, ec.x, ec.y) <= 1:
-                    dmg = _scaled_damage(getattr(sq, 'hp', SQUAD_MAX_HP), 25)
+                    audit_events.append({"type": "move", "side": "player", "unit": "squadron", "id": sq.id, "from": [sq.pos.x, sq.pos.y], "target": [tgt.x, tgt.y], "trace": trace})
+                if sq.hex_distance(ec) <= 1:
+                    dmg = _scaled_damage(sq.hp, 25)
                     total_enemy_damage += dmg
                     # enemy AA
-                    aa = _scaled_aa(getattr(ec, 'hp', CARRIER_MAX_HP), 20)
+                    aa = _scaled_aa(ec.hp, 20)
                     sq.hp = max(0, (sq.hp or SQUAD_MAX_HP) - aa)
                     if audit_events is not None:
                         audit_events.append({"type": "attack", "side": "player", "unit": "squadron", "id": sq.id, "damage": dmg, "aa": aa, "unit_hp_after": sq.hp})
                     if sq.hp <= 0:
-                        sq.state = "lost"; sq.x = None; sq.y = None; sq.target = None
+                        sq.state = "lost"; sq.pos = Position.invalid(); sq.target = None
                     else:
                         sq.state = "returning"
                 else:
                     sq.state = "engaging"
             else:
                 if sq.target is not None:
-                    obj = {'x': sq.x, 'y': sq.y, 'pass_islands': True}
-                    tgt = {'x': sq.target.x, 'y': sq.target.y}
+                    obj = sq.pos
+                    tgt = sq.target
                     trace = []
-                    avoid_prev = sess.last_pos_player_sq.get(sq.id) if prev_pos is not None else None
-                    _step_on_grid_towards(sess, obj, tgt, getattr(sq, 'speed', 10) or 10, ignore_id=sq.id, track_path=path_sweep, track_range=getattr(sq, 'vision', VISION_SQUADRON) or VISION_SQUADRON, debug_trace=trace, avoid_prev_pos=avoid_prev)
-                    sq.x, sq.y = obj['x'], obj['y']
+                    avoid_prev = sess.player_state.last_pos_squadrons.get(sq.id) if prev_pos is not None else None
+                    obj_new = _step_on_grid_towards(sess, obj,is_pass_islands, tgt,sq.speed, ignore_id=sq.id, track_path=path_sweep, track_range=sq.vision or VISION_SQUADRON, debug_trace=trace, avoid_prev_pos=avoid_prev)
+                    sq.pos = obj_new
                     if audit_events is not None:
-                        audit_events.append({"type": "move", "side": "player", "unit": "squadron", "id": sq.id, "from": [sq.x, sq.y], "target": [tgt['x'], tgt['y']], "trace": trace})
-                    if sq.x == sq.target.x and sq.y == sq.target.y:
+                        audit_events.append({"type": "move", "side": "player", "unit": "squadron", "id": sq.id, "from": [sq.pos.x, sq.pos.y], "target": [tgt.x, tgt.y], "trace": trace})
+                    if sq.pos == sq.target:
                         sq.state = "returning"
         elif sq.state == "engaging":
-            obj = {'x': sq.x, 'y': sq.y, 'pass_islands': True}
-            tgt = {'x': ec.x, 'y': ec.y}
+            obj = sq.pos
+            tgt = ec.pos
             trace = []
-            avoid_prev = sess.last_pos_player_sq.get(sq.id) if prev_pos is not None else None
-            _step_on_grid_towards(sess, obj, tgt, getattr(sq, 'speed', 10) or 10, stop_range=1, ignore_id=sq.id, track_path=path_sweep, track_range=getattr(sq, 'vision', VISION_SQUADRON) or VISION_SQUADRON, debug_trace=trace, avoid_prev_pos=avoid_prev)
-            sq.x, sq.y = obj['x'], obj['y']
+            avoid_prev = sess.player_state.last_pos_squadrons.get(sq.id) if prev_pos is not None else None
+            obj_new = _step_on_grid_towards(sess, obj, is_pass_islands, tgt,sq.speed, stop_range=1, ignore_id=sq.id, track_path=path_sweep, track_range=sq.vision or VISION_SQUADRON, debug_trace=trace, avoid_prev_pos=avoid_prev)
+            sq.pos = obj_new
             if audit_events is not None:
-                audit_events.append({"type": "move", "side": "player", "unit": "squadron", "id": sq.id, "from": [sq.x, sq.y], "target": [tgt['x'], tgt['y']], "trace": trace})
-            if _hex_distance(sq.x, sq.y, ec.x, ec.y) <= 1:
-                dmg = _scaled_damage(getattr(sq, 'hp', SQUAD_MAX_HP), 25)
+                audit_events.append({"type": "move", "side": "player", "unit": "squadron", "id": sq.id, "from": [sq.pos.x, sq.pos.y], "target": [tgt.x, tgt.y], "trace": trace})
+            if sq.hex_distance(ec) <= 1:
+                dmg = _scaled_damage(sq.hp, 25)
                 total_enemy_damage += dmg
-                aa = _scaled_aa(getattr(ec, 'hp', CARRIER_MAX_HP), 20)
+                aa = _scaled_aa( ec.hp, 20)
                 sq.hp = max(0, (sq.hp or SQUAD_MAX_HP) - aa)
                 if audit_events is not None:
                     audit_events.append({"type": "attack", "side": "player", "unit": "squadron", "id": sq.id, "damage": dmg, "aa": aa, "unit_hp_after": sq.hp})
                 if sq.hp <= 0:
-                    sq.state = "lost"; sq.x = None; sq.y = None; sq.target = None
+                    sq.state = "lost"; sq.pos = Position.invalid(); sq.target = None
                 else:
                     sq.state = "returning"
         elif sq.state == "returning":
-            obj = {'x': sq.x, 'y': sq.y, 'pass_islands': True}
-            tgt = {'x': pc.x, 'y': pc.y}
+            obj = sq.pos
+            tgt = pc.pos
             trace = []
-            avoid_prev = sess.last_pos_player_sq.get(sq.id) if prev_pos is not None else None
-            _step_on_grid_towards(sess, obj, tgt, getattr(sq, 'speed', 10) or 10, stop_range=1, ignore_id=sq.id, track_path=path_sweep, track_range=getattr(sq, 'vision', VISION_SQUADRON) or VISION_SQUADRON, debug_trace=trace, avoid_prev_pos=avoid_prev)
-            sq.x, sq.y = obj['x'], obj['y']
+            avoid_prev = sess.player_state.last_pos_squadrons.get(sq.id) if prev_pos is not None else None
+            obj_new = _step_on_grid_towards(sess, obj, is_pass_islands, tgt,sq.speed, stop_range=1, ignore_id=sq.id, track_path=path_sweep, track_range=sq.vision or VISION_SQUADRON, debug_trace=trace, avoid_prev_pos=avoid_prev)
+            sq.pos = obj_new
             if audit_events is not None:
-                audit_events.append({"type": "move", "side": "player", "unit": "squadron", "id": sq.id, "from": [sq.x, sq.y], "target": [tgt['x'], tgt['y']], "trace": trace})
-            if _hex_distance(sq.x, sq.y, pc.x, pc.y) <= 1:
-                sq.state = "base"; sq.x = None; sq.y = None; sq.target = None
+                audit_events.append({"type": "move", "side": "player", "unit": "squadron", "id": sq.id, "from": [sq.pos.x, sq.pos.y], "target": [tgt.x, tgt.y], "trace": trace})
+            if sq.hex_distance(pc) <= 1:
+                sq.state = "base"; sq.pos = Position.invalid(); sq.target = None
         # update last pos for next turn avoidance
         if prev_pos is not None:
-            sess.last_pos_player_sq[sq.id] = prev_pos
+            sess.player_state.last_pos_squadrons[sq.id] = prev_pos
     return total_enemy_damage
 
 
-def _apply_player_orders(sess: Session, req: SessionStepRequest, path_sweep: Optional[list] = None, audit_events: Optional[list] = None):
+def _apply_player_orders(sess: Session, req: SessionStepRequest, path_sweep: Optional[list[TrackPos]] = None, audit_events: Optional[list] = None):
     orders = req.player_orders
     pc = sess.player_state.carrier
-    if orders:
-        # Carrier move
-        if orders.carrier_target is not None:
-            prev_pos_car = (pc.x, pc.y)
-            obj = {'x': pc.x, 'y': pc.y, 'pass_islands': False}
-            tgt = {'x': orders.carrier_target.x, 'y': orders.carrier_target.y}
-            trace = []
-            # Precompute full planned path for logging
-            planned_path = _gradient_full_path(
-                sess,
-                (prev_pos_car[0], prev_pos_car[1]),
-                (tgt['x'], tgt['y']),
-                pass_islands=False,
-                stop_range=0,
-            )
-            _step_on_grid_towards(sess, obj, tgt, getattr(pc, 'speed', 2) or 2, stop_range=0, track_path=path_sweep, track_range=getattr(pc, 'vision', VISION_CARRIER) or VISION_CARRIER, debug_trace=trace, avoid_prev_pos=sess.last_pos_player_carrier)
-            pc.x, pc.y = obj['x'], obj['y']
-            sess.last_pos_player_carrier = prev_pos_car
-            if audit_events is not None:
-                audit_events.append({
-                    "type": "move", "side": "player", "unit": "carrier",
-                    "from": [prev_pos_car[0], prev_pos_car[1]],
-                    "target": [tgt['x'], tgt['y']],
-                    "planned_path": planned_path,
-                    "steps_taken": len([e for e in trace if e.get('to')]),
-                    "trace": trace,
-                })
-            # Write move instruction to .map (from previous position to ordered target)
+    is_pass_islands = False
+    # Update server-persistent carrier target if new order provided
+    if orders and orders.carrier_target is not None:
+        requested = Position(x=orders.carrier_target.x, y=orders.carrier_target.y)
+        # If requested tile is land, adjust to nearest sea tile
+        adj = _nearest_sea_tile(sess, requested)
+        if adj is not None:
+            sess.player_state.carrier_target = adj
+        else:
+            sess.player_state.carrier_target = requested
+    # Move carrier toward current persistent target if any
+    tgt = sess.player_state.carrier_target
+    if tgt is not None:
+        prev_pos_car = pc.pos
+        obj = pc.pos
+        trace = []
+        planned_path = _gradient_full_path(
+            sess,
+            prev_pos_car,
+            tgt,
+            pass_islands=False,
+            stop_range=0,
+        )
+        obj_new = _step_on_grid_towards(
+            sess,
+            obj,
+            is_pass_islands,
+            tgt,
+            pc.speed,
+            stop_range=0,
+            track_path=path_sweep,
+            track_range=pc.vision,
+            debug_trace=trace,
+            avoid_prev_pos=sess.player_state.last_pos_carrier,
+        )
+        pc.pos = obj_new
+        pc.target = tgt
+        sess.player_state.last_pos_carrier = prev_pos_car
+        if audit_events is not None:
+            audit_events.append({
+                "type": "move", "side": "player", "unit": "carrier",
+                "from": [prev_pos_car.x, prev_pos_car.y],
+                "target": [tgt.x, tgt.y],
+                "planned_path": planned_path,
+                "steps_taken": len([e for e in trace if e.get('to')]),
+                "trace": trace,
+            })
+        # Log map instruction only when a new user order came in this step
+        if orders and orders.carrier_target is not None:
             try:
-                ordered_to = (tgt['x'], tgt['y'])
+                ordered_to = tgt
                 if sess.last_logged_player_target != ordered_to:
                     maplog_write(
-                        sess.id,
+                        sess.session_id,
                         {
                             "type": "move",
                             "side": "player",
-                            "from": [prev_pos_car[0], prev_pos_car[1]],
-                            "to": [tgt['x'], tgt['y']],
+                            "from": [prev_pos_car.x, prev_pos_car.y],
+                            "to": [tgt.x, tgt.y],
                         },
                     )
                     sess.last_logged_player_target = ordered_to
             except Exception:
                 pass
-        # Launch one squadron
-        if orders.launch_target is not None:
-            # find base-available squadron
-            sq = next((s for s in sess.player_state.squadrons if s.state == 'base' and (s.hp or SQUAD_MAX_HP) > 0), None)
-            if sq is not None:
-                # clamp range and spawn near carrier
-                tgt = Position(x=orders.launch_target.x, y=orders.launch_target.y)
-                spawn = _find_free_adjacent(sess, pc.x, pc.y, prefer_away_from=tgt)
-                if spawn is not None:
-                    if audit_events is not None:
-                        audit_events.append({"type": "launch", "side": "player", "unit": "squadron", "id": sq.id, "spawn": [spawn.x, spawn.y], "target": [tgt.x, tgt.y]})
-                    sq.x, sq.y = spawn.x, spawn.y
-                    sq.target = tgt
-                    sq.state = 'outbound'
+        # If reached destination, clear target
+        if pc.pos == tgt:
+            pc.target = None
+            sess.player_state.carrier_target = None
+    # Launch one squadron
+    if orders and orders.launch_target is not None:
+        # find base-available squadron
+        sq = next((s for s in sess.player_state.squadrons if s.state == 'base' and (s.hp or SQUAD_MAX_HP) > 0), None)
+        if sq is not None:
+            # clamp range and spawn near carrier
+            requested = Position(x=orders.launch_target.x, y=orders.launch_target.y)
+            # Clamp to squadron maximum range from carrier
+            max_range = SQUADRON_RANGE
+            # If within range, keep as is; otherwise, walk along gradient path for exactly max_range steps (aircraft pass islands)
+            if pc.hex_distance(requested) > max_range:
+                path = _gradient_full_path(sess, pc.pos, requested, pass_islands=True, stop_range=0)
+                if len(path) >= 2:
+                    idx = min(max_range, len(path) - 1)
+                    tgt = path[idx]
+                else:
+                    tgt = requested
+            else:
+                tgt = requested
+            spawn = _find_free_adjacent(sess, pc.pos, prefer_away_from=tgt)
+            if spawn is not None:
+                if audit_events is not None:
+                    audit_events.append({"type": "launch", "side": "player", "unit": "squadron", "id": sq.id, "spawn": [spawn.x, spawn.y], "target": [tgt.x, tgt.y]})
+                sq.pos = spawn
+                sq.target = tgt
+                sq.state = 'outbound'
 
 
-def _visibility_key(x: int, y: int) -> str:
-    return f"{x},{y}"
+def _visibility_key(pos: Position) -> str:
+    return f"{pos.x},{pos.y}"
 
 
-def _mark_visibility_circle(sess: Session, vis: set, cx: int, cy: int, rng: int):
+def _mark_visibility_circle(sess: Session, vis: set, pos: Position, rng: int):
+    cx, cy = pos.x, pos.y
     R = max(0, int(rng))
     H = len(sess.map)
     W = len(sess.map[0]) if H > 0 else 0
     for y in range(max(0, cy - (R + 2)), min(H, cy + (R + 3))):
         for x in range(max(0, cx - (R + 2)), min(W, cx + (R + 3))):
-            if _hex_distance(x, y, cx, cy) <= R:
-                vis.add(_visibility_key(x, y))
+            np = Position(x=x, y=y)
+            if np.hex_distance(pos) <= R:
+                vis.add(_visibility_key(np))
 
 
-def _compute_player_visibility(sess: Session, path_sweep: Optional[list]) -> set:
+def _compute_player_visibility(sess: Session, path_sweep: Optional[list[TrackPos]]) -> set:
     vis: set = set()
     pc = sess.player_state.carrier
-    _mark_visibility_circle(sess, vis, pc.x, pc.y, getattr(pc, 'vision', VISION_CARRIER) or VISION_CARRIER)
+    _mark_visibility_circle(sess, vis, pc.pos, pc.vision)
     for sq in sess.player_state.squadrons:
-        if sq.state not in ('base', 'lost') and sq.x is not None and sq.y is not None:
-            _mark_visibility_circle(sess, vis, sq.x, sq.y, getattr(sq, 'vision', VISION_SQUADRON) or VISION_SQUADRON)
+        if sq.is_active():
+            _mark_visibility_circle(sess, vis, sq.pos, sq.vision)
     # path sweep
     for step in (path_sweep or []):
-        _mark_visibility_circle(sess, vis, step['x'], step['y'], int(step.get('range', 0)))
+        _mark_visibility_circle(sess, vis, step, step.range)
     return vis
 
 
@@ -1113,46 +1130,69 @@ def _enemy_sees_player_carrier(sess: Session) -> Optional[Position]:
     pc = sess.player_state.carrier
     ec = sess.enemy_state.carrier
     # enemy carrier eyesight
-    if _hex_distance(ec.x, ec.y, pc.x, pc.y) <= getattr(ec, 'vision', VISION_CARRIER):
-        return Position(x=pc.x, y=pc.y)
+    if ec.hex_distance(pc) <= ec.vision:
+        return pc.pos.model_copy()
     # enemy squadrons
     for sq in sess.enemy_state.squadrons:
-        if sq.state in ('base', 'lost') or sq.x is None or sq.y is None:
+        if not sq.is_active():
             continue
-        if _hex_distance(sq.x, sq.y, pc.x, pc.y) <= getattr(sq, 'vision', VISION_SQUADRON):
-            return Position(x=pc.x, y=pc.y)
+        if sq.hex_distance(pc) <= sq.vision:
+            return pc.pos.model_copy()
     return None
-
+    
 
 def _validate_sea_connectivity(sess: Session):
     # BFS-like reachability over sea using distance field from an arbitrary sea tile
     H = len(sess.map)
     W = len(sess.map[0]) if H > 0 else 0
-    sea = []
+    sea:list[Position] = []
     for y in range(H):
         for x in range(W):
             if sess.map[y][x] == 0:
-                sea.append((x, y))
+                sea.append(Position(x=x, y=y))
     sea_total = len(sea)
     if sea_total == 0:
         return True, 0, 0
-    sx, sy = sea[0]
-    dist = _distance_field_hex(sess, (sx, sy), pass_islands=False, ignore_id=None, player_obs=None, stop_range=0, avoid_prev_pos=None)
+    spos = sea[0]
+    dist = _distance_field_hex(sess,spos, pass_islands=False, ignore_id=None, player_obs=None, stop_range=0, avoid_prev_pos=None)
     if dist is None:
         return False, sea_total, 0
     INF = 10 ** 8
     reached = 0
-    for x, y in sea:
-        if 0 <= y < H and 0 <= x < W and dist[y][x] < INF:
+    for spos in sea:
+        if 0 <= spos.y < H and 0 <= spos.x < W and dist[y][x] < INF:
             reached += 1
     return reached == sea_total, sea_total, reached
 
+
+class HexArray:
+
+    def __init__( self, width:int, height: int ):
+        self.m = [[0 for _ in range(width)] for __ in range(height)]
+    
+    def dump(self):
+        """キャラクタベースのヘックスマップをプリントする。
+        偶数/奇数行をインデントして六角形グリッドの視覚的なズレを表現します。
+        0 を海 (.)、非0 を陸 (#) として表示します。
+        """
+        yy = "  "
+        for x, col in enumerate(self.m[0]):
+            yy += f" {x:2d}"
+        print(yy)
+        for y, row in enumerate(self.m):
+            # 奇数行を少しインデント（見やすさ向上）
+            yy = f"{y:2d}: "
+            prefix = "  " if y % 2 == 1 else ""
+            chars = []
+            for cell in row:
+                chars.append(f"{cell}")
+            print(yy + prefix + "  ".join(chars))
 
 # ==== Server-side map generation helpers ====
 def _generate_connected_map(width: int, height: int, *, blobs: int = 10, rng: Optional[random.Random] = None):
     r = rng or random.Random()
     for _attempt in range(60):
-        m = [[0 for _ in range(width)] for __ in range(height)]
+        m = HexArray(width,height).m
         for _ in range(blobs):
             cx = r.randint(2, max(2, width - 3))
             cy = r.randint(2, max(2, height - 3))
@@ -1164,79 +1204,73 @@ def _generate_connected_map(width: int, height: int, *, blobs: int = 10, rng: Op
                         y = max(0, min(height - 1, cy + dy))
                         m[y][x] = 1
         # quick connectivity check using a temp session
-        tmp_sess = Session(
-            id="tmp",
-            map=m,
-            enemy_state=EnemyState(carrier=CarrierState(id="E", x=0, y=0), squadrons=[]),
-            player_state=EnemyState(carrier=CarrierState(id="P", x=0, y=0), squadrons=[]),
-            enemy_memory=EnemyMemory(enemy_ai=EnemyAIState()),
-        )
+        tmp_sess = Session(session_id="tmp", map=m )
         ok, sea_total, sea_reached = _validate_sea_connectivity(tmp_sess)
         if ok:
             return m
     return m
 
 
-def _carve_sea(m: list, cx: int, cy: int, r: int):
+def _carve_sea(m: list, pos: Position, r: int):
     H = len(m)
     W = len(m[0]) if H > 0 else 0
     for y in range(H):
         for x in range(W):
-            if _hex_distance(x, y, cx, cy) <= r:
+            if pos.hex_distance(Position(x=x, y=y) ) <= r:
                 m[y][x] = 0
 
 
-def _game_status(sess: Session):
+def _game_status(sess: Session) -> GameStatus:
     # Determine game over conditions
     if sess.enemy_state.carrier.hp <= 0:
-        return {'over': True, 'result': 'win', 'message': '敵空母撃沈！勝利', 'turn': sess.turn}
+        return GameStatus(over=True, result='win', message='敵空母撃沈！勝利', turn=sess.turn)
     if sess.player_state.carrier.hp <= 0:
-        return {'over': True, 'result': 'lose', 'message': '我が空母撃沈…敗北', 'turn': sess.turn}
+        return GameStatus(over=True, result='lose', message='我が空母撃沈…敗北', turn=sess.turn)
     if sess.turn >= sess.max_turns:
         pc = sess.player_state.carrier.hp
         ec = sess.enemy_state.carrier.hp
         if pc > ec:
-            return {'over': True, 'result': 'win', 'message': '終戦判定：優勢で勝利', 'turn': sess.turn}
+            return GameStatus(over=True, result='win', message='終戦判定：優勢で勝利', turn=sess.turn)
         if pc < ec:
-            return {'over': True, 'result': 'lose', 'message': '終戦判定：劣勢で敗北', 'turn': sess.turn}
-        return {'over': True, 'result': 'draw', 'message': '終戦判定：引き分け', 'turn': sess.turn}
-    return {'over': False, 'turn': sess.turn}
+            return GameStatus(over=True, result='lose', message='終戦判定：劣勢で敗北', turn=sess.turn)
+        return GameStatus(over=True, result='draw', message='終戦判定：引き分け', turn=sess.turn)
+    return GameStatus(over=False, turn=sess.turn)
 
 
 def _update_player_intel(sess: Session, turn_visible: set) -> PlayerIntel:
     # Carrier intel
     ec = sess.enemy_state.carrier
-    key = _visibility_key(ec.x, ec.y)
+    key = _visibility_key(ec.pos)
     if key in turn_visible:
-        sess.player_intel_carrier = IntelMarker(seen=True, x=ec.x, y=ec.y, ttl=3)
+        sess.player_intel.carrier = IntelMarker(seen=True, pos=ec.pos, ttl=3)
     else:
-        if sess.player_intel_carrier and sess.player_intel_carrier.ttl > 0:
-            ttl = max(0, sess.player_intel_carrier.ttl - 1)
-            sess.player_intel_carrier = IntelMarker(seen=ttl > 0, x=sess.player_intel_carrier.x, y=sess.player_intel_carrier.y, ttl=ttl)
+        if sess.player_intel.carrier and sess.player_intel.carrier.ttl > 0:
+            ttl = max(0, sess.player_intel.carrier.ttl - 1)
+            sess.player_intel.carrier = IntelMarker(seen=ttl > 0, pos=sess.player_intel.carrier.pos, ttl=ttl)
 
     # Squadrons intel
     current_ids = set()
     for s in sess.enemy_state.squadrons:
-        if s.state in ('base', 'lost') or s.x is None or s.y is None:
+        if not s.is_active():
             continue
         current_ids.add(s.id)
-        k = _visibility_key(s.x, s.y)
+        k = _visibility_key(s.pos)
         if k in turn_visible:
-            sess.player_intel_squadrons[s.id] = IntelMarker(seen=True, x=s.x, y=s.y, ttl=3)
+            sess.player_intel.squadrons[s.id] = IntelMarker(seen=True, pos=s.pos, ttl=3)
         else:
-            m = sess.player_intel_squadrons.get(s.id)
+            m = sess.player_intel.squadrons.get(s.id)
             if m and m.ttl > 0:
                 ttl = max(0, m.ttl - 1)
-                sess.player_intel_squadrons[s.id] = IntelMarker(seen=ttl > 0, x=m.x, y=m.y, ttl=ttl)
+                sess.player_intel.squadrons[s.id] = IntelMarker(seen=ttl > 0, pos=m.pos, ttl=ttl)
     # Decay intel for squadrons that no longer exist in state
-    for sid, m in list(sess.player_intel_squadrons.items()):
+    for sid, m in list(sess.player_intel.squadrons.items()):
         if sid not in current_ids and m.ttl > 0:
             ttl = max(0, m.ttl - 1)
-            sess.player_intel_squadrons[sid] = IntelMarker(seen=ttl > 0, x=m.x, y=m.y, ttl=ttl)
+            sess.player_intel.squadrons[sid] = IntelMarker(seen=ttl > 0, pos=m.pos, ttl=ttl)
 
     # Build response (only include entries with ttl>0 or currently seen)
     sq_list: list[SquadronIntel] = []
-    for sid, m in sess.player_intel_squadrons.items():
+    for sid, m in sess.player_intel.squadrons.items():
         if m.ttl > 0 or m.seen:
             sq_list.append(SquadronIntel(id=sid, marker=m))
-    return PlayerIntel(carrier=sess.player_intel_carrier, squadrons=sq_list)
+    return PlayerIntel(carrier=sess.player_intel.carrier, squadrons=sq_list)

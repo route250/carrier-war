@@ -18,14 +18,14 @@ from server.schemas import (
 def _clamp(v: int, lo: int, hi: int) -> int:
     return max(lo, min(hi, v))
 
+def _pos_clamp( pos:Position, width:int, height:int) -> Position:
+    return Position(x=_clamp(pos.x, 0, width - 1), y=_clamp(pos.y, 0, height - 1))
 
-def _in_bounds(x: int, y: int, w: int, h: int) -> bool:
-    return 0 <= x < w and 0 <= y < h
 
 
-def _is_sea(grid: List[List[int]], x: int, y: int) -> bool:
+def _is_sea(grid: List[List[int]], pos:Position) -> bool:
     try:
-        return grid[y][x] == 0
+        return grid[pos.y][pos.x] == 0
     except Exception:
         return False
 
@@ -34,28 +34,26 @@ def _chebyshev(a: Position, b: Position) -> int:
     return max(abs(a.x - b.x), abs(a.y - b.y))
 
 
-def _offset_neighbors_odd_r(x: int, y: int) -> List[Tuple[int, int]]:
-    odd = y & 1
+def _offset_neighbors_odd_r(pos: Position) -> List[Position]:
+    odd = pos.y & 1
     if odd:
         deltas = [(+1, 0), (+1, -1), (0, -1), (-1, 0), (0, +1), (+1, +1)]
     else:
         deltas = [(+1, 0), (0, -1), (-1, -1), (-1, 0), (-1, +1), (0, +1)]
-    return [(x + dx, y + dy) for dx, dy in deltas]
+    return [Position(x=pos.x + dx, y=pos.y + dy) for dx, dy in deltas]
 
 
-def _nearest_sea(grid: List[List[int]], x: int, y: int, w: int, h: int) -> Position:
-    x = _clamp(x, 0, w - 1)
-    y = _clamp(y, 0, h - 1)
-    if _is_sea(grid, x, y):
-        return Position(x=x, y=y)
+def _nearest_sea(grid: List[List[int]], pos: Position, w: int, h: int) -> Position:
+    pos = _pos_clamp(pos, w, h)
+    if _is_sea(grid, pos):
+        return pos
     for r in range(1, 7):
         for dy in range(-r, r + 1):
             for dx in range(-r, r + 1):
-                nx = _clamp(x + dx, 0, w - 1)
-                ny = _clamp(y + dy, 0, h - 1)
-                if _is_sea(grid, nx, ny):
-                    return Position(x=nx, y=ny)
-    return Position(x=x, y=y)
+                np = _pos_clamp( Position(x=pos.x+dx,y=pos.y+dy), w, h)
+                if _is_sea(grid, np):
+                    return np
+    return pos
 
 
 def plan_orders(req: PlanRequest) -> PlanResponse:
@@ -65,48 +63,48 @@ def plan_orders(req: PlanRequest) -> PlanResponse:
     height = len(req.map) if req.map else 30
 
     ec = req.enemy_state.carrier
-    start = Position(x=_clamp(ec.x, 0, width - 1), y=_clamp(ec.y, 0, height - 1))
+    start = _pos_clamp(ec.pos, width, height)
     here = Position(x=start.x, y=start.y)
 
     # Known last seen player carrier position (if any)
     last_seen: Optional[Position] = None
     mem_in = req.enemy_memory.carrier_last_seen if req.enemy_memory else None
-    if mem_in and mem_in.seen and mem_in.ttl > 0 and mem_in.x is not None and mem_in.y is not None:
-        last_seen = Position(x=_clamp(mem_in.x, 0, width - 1), y=_clamp(mem_in.y, 0, height - 1))
+    if mem_in and mem_in.seen and mem_in.ttl > 0 and mem_in.pos is not None:
+        last_seen = _pos_clamp( mem_in.pos, width, height)
 
     logs: List[str] = []
 
     # Occupancy sets (known to server)
-    enemy_occ = {(s.x, s.y) for s in req.enemy_state.squadrons if s.x is not None and s.y is not None and s.state not in ("base", "lost")}
+    enemy_occ = set([s.pos for s in req.enemy_state.squadrons if s.state not in ("base", "lost")])
     player_vis_occ = set()
     if req.player_observation:
-        player_vis_occ = {(p.x, p.y) for p in req.player_observation.visible_squadrons}
+        player_vis_occ = set([p.pos for p in req.player_observation.visible_squadrons])
 
-    def cell_free(nx: int, ny: int) -> bool:
-        return _in_bounds(nx, ny, width, height) and _is_sea(req.map, nx, ny) and (nx, ny) not in enemy_occ and (nx, ny) not in player_vis_occ
+    def cell_free(pos:Position) -> bool:
+        return pos.in_bounds(width, height) and _is_sea(req.map, pos) and pos not in enemy_occ and pos not in player_vis_occ
 
     # Enemy carrier movement: 0..speed steps, biased away from last_seen if known
     steps = rng.randint(0, max(0, ec.speed))
     moved = False
     for _ in range(steps):
-        nbs = [(nx, ny) for nx, ny in _offset_neighbors_odd_r(here.x, here.y) if cell_free(nx, ny)]
+        nbs = [nxny for nxny in _offset_neighbors_odd_r(here) if cell_free(nxny)]
         if not nbs:
             break
         if last_seen is not None:
             curd = _chebyshev(here, last_seen)
             # score: prefer larger distance from last_seen, add tiny jitter
             scored = []
-            for nx, ny in nbs:
-                d = max(abs(nx - last_seen.x), abs(ny - last_seen.y))
-                scored.append(((d - curd) + rng.random() * 0.05, (nx, ny)))
+            for npos in nbs:
+                d = max(abs(npos.x - last_seen.x), abs(npos.y - last_seen.y))
+                scored.append(((d - curd) + rng.random() * 0.05, npos))
             scored.sort(key=lambda t: t[0], reverse=True)
-            best_score, (nx, ny) = scored[0]
+            best_score, npos = scored[0]
             # If nothing improves distance, sometimes keep position (50%)
             if best_score <= 0 and rng.random() < 0.5:
                 break
         else:
-            nx, ny = rng.choice(nbs)
-        here = Position(x=nx, y=ny)
+            npos = rng.choice(nbs)
+        here = Position(x=npos.x, y=npos.y)
         moved = True
 
     if moved and (here.x != start.x or here.y != start.y):
@@ -146,7 +144,7 @@ def plan_orders(req: PlanRequest) -> PlanResponse:
                     Position(x=width // 2, y=height // 2),
                 ]
                 wp = pts[ai_in.patrol_ix % len(pts)]
-                tgt = _nearest_sea(req.map, wp.x, wp.y, width, height)
+                tgt = _nearest_sea(req.map, wp, width, height)
                 squadron_orders.append(SquadronOrder(id=base_avail.id, action="launch", target=tgt))
                 logs.append("敵編隊が索敵に出撃した気配")
                 launched_patrol = True
@@ -159,7 +157,7 @@ def plan_orders(req: PlanRequest) -> PlanResponse:
         ttl_next = mem_in.ttl if visible_now else max(0, mem_in.ttl - 1)
         if launched_to_known:
             ttl_next = max(0, ttl_next - 1)
-        mem_out.carrier_last_seen = IntelMarker(seen=ttl_next > 0, x=mem_in.x, y=mem_in.y, ttl=ttl_next)
+        mem_out.carrier_last_seen = IntelMarker(seen=ttl_next > 0, pos=mem_in.pos, ttl=ttl_next)
 
     # Enemy AI patrol memory
     ai_in = req.enemy_memory.enemy_ai if req.enemy_memory and req.enemy_memory.enemy_ai else EnemyAIState()

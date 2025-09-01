@@ -646,8 +646,9 @@ async function ensureSession() {
   state.session_id = data.session_id;
   state.turn = data.turn;
   state.map = data.map;
+  // Server returns authoritative carrier state (including x,y and target)
   state.carrier = { ...state.carrier, ...data.player_state.carrier };
-  state.squadrons = data.player_state.squadrons;
+  state.squadrons = data.player_state.squadrons || [];
   state.enemy.carrier = { ...state.enemy.carrier, ...data.enemy_state.carrier };
 
   return SESSION_ID;
@@ -696,12 +697,13 @@ function enemyTurnFromPlan(plan) {
     const ec = state.enemy.carrier;
     // apply enemy carrier
     state.enemy.carrier = { ...state.enemy.carrier, ...plan.enemy_state.carrier };
-    // apply enemy squadrons
-    state.enemy.squadrons = (plan.enemy_state.squadrons || []).map((s) => ({ id: s.id, state: s.state, hp: s.hp ?? SQUAD_MAX_HP, x: s.x ?? undefined, y: s.y ?? undefined, target: s.target ? { x: s.target.x, y: s.target.y } : undefined, speed: s.speed ?? 10, vision: s.vision ?? VISION_SQUADRON }));
+    // apply enemy squadrons (server-provided x,y)
+    state.enemy.squadrons = plan.enemy_state.squadrons || [];
     // apply player carrier and squadrons (authoritative)
     if (plan.player_state) {
+        // Server is authoritative for carrier target and position
         state.carrier = { ...state.carrier, ...plan.player_state.carrier };
-        state.squadrons = (plan.player_state.squadrons || []).map((s) => ({ id: s.id, state: s.state, hp: s.hp ?? SQUAD_MAX_HP, x: s.x ?? undefined, y: s.y ?? undefined, target: s.target ? { x: s.target.x, y: s.target.y } : undefined, speed: s.speed ?? 10, vision: s.vision ?? VISION_SQUADRON }));
+        state.squadrons = plan.player_state.squadrons || [];
     }
     // memory
     if (plan.enemy_memory_out && plan.enemy_memory_out.carrier_last_seen) {

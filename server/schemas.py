@@ -1,41 +1,188 @@
 from typing import List, Optional, Literal, Dict, Any
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
+try:
+    # pydantic v2 provides computed_field for including derived values in serialization
+    from pydantic import computed_field
+except Exception:  # fallback for environments without pydantic v2
+    computed_field = None  # type: ignore
 
+INF:int = 10**8
 
-class Position(BaseModel):
+class Position(BaseModel,frozen=True):
     x: int
     y: int
 
+    def __hash__(self):
+        return hash((self.x, self.y))
 
-class CarrierState(BaseModel):
+    def __eq__(self, other):
+        if isinstance(other, Position):
+            return self.x == other.x and self.y == other.y
+        return False
+
+    @staticmethod
+    def invalid() -> 'Position':
+        return Position(x=-1, y=-1)
+
+    @staticmethod
+    def new(p1:'int|tuple[int,int]|Position', p2:int|None=None) -> 'Position':
+        if isinstance(p1, Position):
+            return Position(x=p1.x, y=p1.y)
+        elif isinstance(p1, (tuple, list)) and len(p1) == 2:
+            return Position(x=p1[0], y=p1[1])
+        elif isinstance(p1, int) and isinstance(p2, int):
+            return Position(x=p1, y=p2)
+        else:
+            raise TypeError(f"invalid parameters to Position.new {p1}, {p2}")
+
+
+    def in_bounds(self, w: int, h: int) -> bool:
+        return 0 <= self.x < w and 0 <= self.y < h
+
+
+    def hex_distance(self, p1:'int|tuple[int,int]|Position', p2:int|None=None) -> int:
+        if isinstance(p1, Position):
+            x,y = p1.x, p1.y
+        elif isinstance(p1, (tuple, list)) and len(p1) == 2:
+            x,y = p1
+        elif isinstance(p1, int) and isinstance(p2, int):
+            x,y = p1,p2
+        else:
+            raise TypeError("Other must be a Position")
+        aq, ar = Position._offset_to_axial(self.x, self.y)
+        bq, br = Position._offset_to_axial(x, y)
+        ax, ay, az = Position._axial_to_cube(aq, ar)
+        bx, by, bz = Position._axial_to_cube(bq, br)
+        return Position._cube_distance(ax, ay, az, bx, by, bz)
+
+    @staticmethod
+    def _offset_to_axial(col: int, row: int):
+        q = col - ((row - (row & 1)) >> 1)
+        r = row
+        return q, r
+
+    @staticmethod
+    def _axial_to_cube(q: int, r: int):
+        x = q
+        z = r
+        y = -x - z
+        return x, y, z
+
+    @staticmethod
+    def _cube_distance(ax: int, ay: int, az: int, bx: int, by: int, bz: int):
+        return max(abs(ax - bx), abs(ay - by), abs(az - bz))
+
+    @staticmethod
+    def _hex_distance(pos1: 'Position', pos2: 'Position') -> int:
+        aq, ar = Position._offset_to_axial(pos1.x, pos1.y)
+        bq, br = Position._offset_to_axial(pos2.x, pos2.y)
+        ax, ay, az = Position._axial_to_cube(aq, ar)
+        bx, by, bz = Position._axial_to_cube(bq, br)
+        return Position._cube_distance(ax, ay, az, bx, by, bz)
+
+    def offset_neighbors(self):
+        odd = self.y & 1
+        if odd:
+            deltas = [(+1, 0), (+1, -1), (0, -1), (-1, 0), (0, +1), (+1, +1)]
+        else:
+            deltas = [(+1, 0), (0, -1), (-1, -1), (-1, 0), (-1, +1), (0, +1)]
+        for dx, dy in deltas:
+            yield Position(x=self.x + dx, y=self.y + dy)
+
+class TrackPos(Position, frozen=True):
+    range:int
+
+class UnitState(BaseModel):
     id: str
-    x: int
-    y: int
-    hp: int = 100
-    speed: int = 2
-    vision: int = 4
+    pos: Position
+    hp: int
+    speed: int
+    vision: int
+    target: Optional[Position] = None
+
+    def is_active(self) -> bool:
+        return self.hp > 0 and self.pos is not None and self.pos.x >= 0 and self.pos.y >= 0
+
+    def is_visible_to_player(self, other:'UnitState') -> bool:
+        """Return True if tile (x,y) is visible to the player (carrier or active squadrons).
+        """
+        return self.hex_distance(other) <= self.vision
+
+    def hex_distance(self, other:'UnitState|Position') -> int:
+        if self.is_active():
+            if isinstance(other, Position) and other.x>=0 and other.y>=0:
+                return self.pos.hex_distance(other)
+            elif isinstance(other, UnitState) and other.is_active():
+                return self.pos.hex_distance(other.pos)
+        return INF
+
+    # Flattened coordinates for client convenience (read-only, derived from pos)
+    if computed_field:
+        @computed_field  # type: ignore[misc]
+        def x(self) -> Optional[int]:
+            try:
+                return self.pos.x if (self.pos and self.pos.x >= 0 and self.pos.y >= 0) else None
+            except Exception:
+                return None
+
+        @computed_field  # type: ignore[misc]
+        def y(self) -> Optional[int]:
+            try:
+                return self.pos.y if (self.pos and self.pos.x >= 0 and self.pos.y >= 0) else None
+            except Exception:
+                return None
+
+class CarrierState(UnitState):
     hangar: int = 2
 
 
-class SquadronState(BaseModel):
-    id: str
+class SquadronState(UnitState):
     state: Literal["base", "outbound", "engaging", "returning", "lost"]
-    hp: int = 40
-    x: Optional[int] = None
-    y: Optional[int] = None
-    target: Optional[Position] = None
+
+    def is_active(self) -> bool:
+        return super().is_active() and self.state != "lost" and self.state != 'base'
 
 
-class EnemyState(BaseModel):
+class PlayerState(BaseModel):
     carrier: CarrierState
     squadrons: List[SquadronState] = []
+    # Server-authoritative persistent move target for the player's carrier
+    carrier_target: Optional[Position] = Field(default=None, exclude=True)
+    # Cross-turn last positions to avoid immediate backtracking across turns
+    last_pos_squadrons: Dict[str, Position] = Field(default_factory=dict, exclude=True)
+    last_pos_carrier: Optional[Position] = Field(default=None, exclude=True)
+
+    def is_visible_to_player(self, unit:UnitState) -> bool:
+        """Return True if tile (x,y) is visible to the player (carrier or active squadrons).
+        """
+        if self.carrier and self.carrier.is_visible_to_player(unit):
+            return True
+        for sq in self.squadrons:
+            if sq.is_visible_to_player(unit):
+                return True
+        return False
 
 
 class IntelMarker(BaseModel):
     seen: bool
-    x: Optional[int] = None
-    y: Optional[int] = None
-    ttl: int = 0
+    pos: Position
+    ttl: int
+
+    # Flattened coordinates for client convenience (read-only)
+    if computed_field:
+        @computed_field  # type: ignore[misc]
+        def x(self) -> Optional[int]:
+            try:
+                return self.pos.x if (self.pos and self.pos.x >= 0 and self.pos.y >= 0) else None
+            except Exception:
+                return None
+
+        @computed_field  # type: ignore[misc]
+        def y(self) -> Optional[int]:
+            try:
+                return self.pos.y if (self.pos and self.pos.x >= 0 and self.pos.y >= 0) else None
+            except Exception:
+                return None
 
 
 class EnemyAIState(BaseModel):
@@ -58,10 +205,15 @@ class PlayerIntel(BaseModel):
     squadrons: List[SquadronIntel] = []
 
 
+class SideIntel(BaseModel):
+    # Symmetric intel container per side (server-internal)
+    carrier: Optional[IntelMarker] = None
+    squadrons: Dict[str, IntelMarker] = Field(default_factory=dict)
+
+
 class SquadronLight(BaseModel):
     id: str
-    x: int
-    y: int
+    pos: Position
 
 
 class PlayerObservation(BaseModel):
@@ -76,7 +228,7 @@ class Config(BaseModel):
 class PlanRequest(BaseModel):
     turn: int
     map: List[List[int]]
-    enemy_state: EnemyState
+    enemy_state: PlayerState
     enemy_memory: Optional[EnemyMemory] = None
     player_observation: Optional[PlayerObservation] = None
     config: Optional[Config] = None
@@ -112,9 +264,9 @@ class SessionCreateRequest(BaseModel):
 class SessionCreateResponse(BaseModel):
     session_id: str
     map: List[List[int]]
-    enemy_state: EnemyState
+    enemy_state: PlayerState
     enemy_memory: EnemyMemory
-    player_state: EnemyState
+    player_state: PlayerState
     turn: int = 1
     config: Optional[Config] = None
 
@@ -135,11 +287,10 @@ class StepEffects(BaseModel):
 
 
 class GameStatus(BaseModel):
+    turn: int
     over: bool = False
     result: Optional[Literal['win','lose','draw']] = None
     message: Optional[str] = None
-    turn: Optional[int] = None
-
 
 class SessionStepResponse(BaseModel):
     session_id: str
@@ -148,8 +299,8 @@ class SessionStepResponse(BaseModel):
     carrier_order: Optional[CarrierOrder] = None
     squadron_orders: List[SquadronOrder] = []
     # Authoritative enemy state after applying orders and progression
-    enemy_state: EnemyState
-    player_state: EnemyState
+    enemy_state: PlayerState
+    player_state: PlayerState
     enemy_memory_out: Optional[EnemyMemory] = None
     effects: StepEffects = StepEffects()
     logs: List[str] = []
@@ -159,3 +310,5 @@ class SessionStepResponse(BaseModel):
     game_status: Optional[GameStatus] = None
     # Player intel (server-computed memory based on visibility)
     player_intel: Optional[PlayerIntel] = None
+    # Symmetric enemy intel (what enemy knows about player), optional for future clients
+    enemy_intel: Optional[PlayerIntel] = Field(default=None, exclude=True)
