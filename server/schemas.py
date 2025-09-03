@@ -9,6 +9,24 @@ except Exception:  # fallback for environments without pydantic v2
 INF:int = 10**8
 
 class Position(BaseModel,frozen=True):
+    def __le__(self, other):
+        if not isinstance(other, Position):
+            return NotImplemented
+        return (self.x, self.y) <= (other.x, other.y)
+
+    def __gt__(self, other):
+        if not isinstance(other, Position):
+            return NotImplemented
+        return (self.x, self.y) > (other.x, other.y)
+
+    def __ge__(self, other):
+        if not isinstance(other, Position):
+            return NotImplemented
+        return (self.x, self.y) >= (other.x, other.y)
+    def __lt__(self, other):
+        if not isinstance(other, Position):
+            return NotImplemented
+        return (self.x, self.y) < (other.x, other.y)
     x: int
     y: int
 
@@ -102,6 +120,11 @@ class UnitState(BaseModel):
 
     def is_active(self) -> bool:
         return self.hp > 0 and self.pos is not None and self.pos.x >= 0 and self.pos.y >= 0
+
+    def can_see_enemy(self, enemy:'UnitState') -> bool:
+        """Return True if tile (x,y) is visible to the player (carrier or active squadrons).
+        """
+        return self.hex_distance(enemy) <= self.vision
 
     def is_visible_to_player(self, other:'UnitState') -> bool:
         """Return True if tile (x,y) is visible to the player (carrier or active squadrons).
@@ -312,3 +335,74 @@ class SessionStepResponse(BaseModel):
     player_intel: Optional[PlayerIntel] = None
     # Symmetric enemy intel (what enemy knows about player), optional for future clients
     enemy_intel: Optional[PlayerIntel] = Field(default=None, exclude=True)
+
+
+# === PvP Match (skeleton) ===
+# まずは最低限の型を用意（段階的に拡張）
+MatchMode = Literal["pve", "pvp"]
+MatchStatus = Literal["waiting", "active", "over"]
+
+
+class MatchCreateRequest(BaseModel):
+    mode: Optional[MatchMode] = "pvp"
+    config: Optional[Config] = None
+    display_name: Optional[str] = None
+
+
+class MatchCreateResponse(BaseModel):
+    match_id: str
+    player_token: str
+    side: Literal["A", "B"] = "A"
+    status: MatchStatus = "waiting"
+    mode: MatchMode = "pvp"
+    config: Optional[Config] = None
+
+
+class MatchListItem(BaseModel):
+    match_id: str
+    status: MatchStatus
+    mode: MatchMode
+    has_open_slot: bool
+    created_at: int
+    config: Optional[Config] = None
+
+
+class MatchListResponse(BaseModel):
+    matches: List[MatchListItem] = []
+
+
+class MatchJoinRequest(BaseModel):
+    display_name: Optional[str] = None
+
+
+class MatchJoinResponse(BaseModel):
+    match_id: str
+    player_token: str
+    side: Literal["A", "B"]
+    status: MatchStatus
+
+
+class MatchStateResponse(BaseModel):
+    match_id: str
+    status: MatchStatus
+    mode: MatchMode
+    turn: int
+    your_side: Optional[Literal["A", "B"]] = None
+    waiting_for: Literal["none", "you", "opponent"] = "none"
+    # Optional minimal board + units snapshot for polling UI
+    map_w: Optional[int] = None
+    map_h: Optional[int] = None
+    a: Optional[Dict[str, Any]] = None  # expects {"carrier": {"x","y","hp"}}
+    b: Optional[Dict[str, Any]] = None
+
+
+class MatchOrdersRequest(BaseModel):
+    player_token: str
+    player_orders: Optional[PlayerOrders] = None
+    # 将来: readyフラグ/キャンセル等
+
+
+class MatchOrdersResponse(BaseModel):
+    accepted: bool = True
+    status: MatchStatus
+    turn: int

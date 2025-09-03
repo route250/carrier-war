@@ -7,45 +7,148 @@
     <link rel="stylesheet" href="/static/styles.css" />
   </head>
   <body>
-    <header class="topbar">
-      <div class="title">Carrier war</div>
-      <div class="controls">
-        <button id="btnNextTurn">次のターン</button>
-        <span class="divider"></span>
-        <button id="btnModeSelect" data-mode="select" class="active">選択</button>
-        <button id="btnModeMove" data-mode="move">空母を移動</button>
-        <button id="btnModeLaunch" data-mode="launch">打撃隊を出撃</button>
-        <span class="divider"></span>
-        <button id="btnRestart">リスタート</button>
-        <button id="btnNewMap">新しい海域</button>
-        <span id="hint" class="hint"></span>
-      </div>
-    </header>
-    <main class="layout">
-      <section class="map-wrap">
-        <canvas id="mapCanvas" width="373" height="373" aria-label="戦場マップ"></canvas>
-        <div id="legend" class="legend">
-          <div><span class="chip chip-carrier"></span>空母</div>
-          <div><span class="chip chip-squad"></span>航空機</div>
-          <div><span class="chip" style="background: var(--enemy); border: 1px solid #7a2c2c"></span>敵空母（発見時）</div>
-          <div><span class="chip" style="background: var(--enemy-squad); border: 1px solid #7a522c"></span>敵編隊（発見時）</div>
+    <!-- Entrance View -->
+    <div id="view-entrance" class="view">
+      <div class="center">
+        <h1>Carrier war</h1>
+        <p class="muted">ユーザ名を入力してください</p>
+        <div class="form-row">
+          <input id="usernameInput" type="text" placeholder="ユーザ名" />
+          <button id="enterLobby">ロビーへ</button>
         </div>
+      </div>
+    </div>
+
+    <!-- Lobby View -->
+    <div id="view-lobby" class="view hidden">
+      <header class="topbar">
+        <div class="title">ロビー</div>
+        <div class="controls">
+          <span id="lobbyUser" class="hint"></span>
+        </div>
+      </header>
+      <main class="lobby">
+        <div class="tabs">
+          <button class="tab active" data-lobby="pve">対AI</button>
+          <button class="tab" data-lobby="pvp">対人</button>
+        </div>
+
+        <section id="lobby-pve">
+          <div class="list">
+            <div class="opponent-card selected" data-opponent="AI" data-difficulty="easy">
+              <div class="name">AI (Easy)</div>
+              <div class="desc">初心者向け。控えめな行動。</div>
+            </div>
+            <div class="opponent-card" data-opponent="AI" data-difficulty="normal">
+              <div class="name">AI (Normal)</div>
+              <div class="desc">標準の難易度。</div>
+            </div>
+            <div class="opponent-card" data-opponent="AI" data-difficulty="hard">
+              <div class="name">AI (Hard)</div>
+              <div class="desc">上級者向け。積極的に攻めます。</div>
+            </div>
+          </div>
+          <div class="actions">
+            <button id="startGameBtn">ゲーム開始</button>
+          </div>
+        </section>
+
+        <section id="lobby-pvp" class="hidden">
+            <div class="pvp-actions">
+            <button id="btnCreateMatch">マッチ作成</button>
+          </div>
+          <div id="matchList" class="match-list empty">読み込み中...</div>
+        </section>
+      </main>
+    </div>
+
+    <!-- Game View -->
+    <div id="view-game" class="view hidden">
+      <header class="topbar">
+        <div class="title">Carrier war</div>
+        <div class="controls">
+          <button id="btnNextTurn">次のターン</button>
+          <span class="divider"></span>
+          <!-- 選択モードボタンは不要のため削除 -->
+          <button id="btnModeMove" data-mode="move">空母を移動</button>
+          <button id="btnModeLaunch" data-mode="launch">打撃隊を出撃</button>
+          <span class="divider"></span>
+          <button id="btnRestart">リスタート</button>
+          <button id="btnNewMap">新しい海域</button>
+          <span id="hint" class="hint"></span>
+        </div>
+      </header>
+      <main class="layout">
+        <section class="map-wrap">
+          <canvas id="mapCanvas" width="373" height="373" aria-label="戦場マップ"></canvas>
+          <div id="legend" class="legend">
+            <div><span class="chip chip-carrier"></span>空母</div>
+            <div><span class="chip chip-squad"></span>航空機</div>
+            <div><span class="chip" style="background: var(--enemy); border: 1px solid #7a2c2c"></span>敵空母（発見時）</div>
+            <div><span class="chip" style="background: var(--enemy-squad); border: 1px solid #7a522c"></span>敵編隊（発見時）</div>
+          </div>
+        </section>
+        <aside class="sidebar">
+          <section>
+            <h2>空母</h2>
+            <div id="carrierStatus" class="panel"></div>
+          </section>
+          <section>
+            <h2>航空機編隊</h2>
+            <div id="squadronList" class="panel"></div>
+          </section>
+        </aside>
+      </main>
+      <section class="log-wrap">
+        <h2>ログ</h2>
+        <div id="log" class="log"></div>
       </section>
-      <aside class="sidebar">
-        <section>
-          <h2>空母</h2>
-          <div id="carrierStatus" class="panel"></div>
+    </div>
+
+    <!-- Match Room View (PvP) -->
+    <div id="view-match" class="view hidden">
+      <header class="topbar">
+        <div class="title machInfo">PvP対戦 <span id="matchInfo" class="hint"></span></div>
+        <div class="controls">
+          <span class="divider"></span>
+          <button id="btnLeaveMatch">ロビーへ戻る</button>
+        </div>
+      </header>
+      <main class="match-room">
+          <div class="room-actions">
+          <button id="btnSubmitReady">Done</button>
+          <span class="divider"></span>
+          <button class="mode-btn active" id="btnMatchModeMove" data-match-mode="move">空母</button>
+          <button class="mode-btn" id="btnMatchModeLaunch" data-match-mode="launch">航空部隊</button>
+          <span id="matchHint" class="hint"></span>
+          <span class="grow"></span>
+        </div>
+        <section class="match-layout">
+          <div class="match-board">
+            <canvas id="matchCanvas" width="540" height="540" aria-label="PvPマップ"></canvas>
+            <div class="legend">
+              <div><span class="chip chip-carrier"></span>空母</div>
+              <div><span class="chip" style="background: var(--enemy); border: 1px solid #7a2c2c"></span>相手の空母</div>
+            </div>
+            <p class="muted">キャンバスをクリックで目的地を指定（移動モード時）。</p>
+          </div>
+          <aside class="match-sidebar">
+            <section>
+              <h2>空母</h2>
+              <div id="matchCarrierStatus" class="panel"></div>
+            </section>
+            <section>
+              <h2>航空部隊</h2>
+              <div id="matchSquadronList" class="panel"></div>
+            </section>
+            <section>
+              <h2>ログ</h2>
+              <div id="matchLog" class="log"></div>
+            </section>
+          </aside>
         </section>
-        <section>
-          <h2>航空機編隊</h2>
-          <div id="squadronList" class="panel"></div>
-        </section>
-      </aside>
-    </main>
-    <section class="log-wrap">
-      <h2>ログ</h2>
-      <div id="log" class="log"></div>
-    </section>
+      </main>
+    </div>
     <script src="/static/main.js"></script>
   </body>
   </html>

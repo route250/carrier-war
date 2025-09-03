@@ -14,6 +14,8 @@ const SQUADRON_RANGE = 22;    // 航空機の航続距離（空母からの最�
 // === State ===
 const SQUAD_MAX_HP = 40;
 const CARRIER_MAX_HP = 100;
+const APP = { view: 'entrance', username: '', opponent: 'AI', difficulty: 'easy', lobbyMode: 'pve', match: null, matchSSE: null, matchHex: null, matchPending: { carrier_target: null, launch_target: null } };
+let GAME_INITIALIZED = false;
 const state = {
   map: [], // 0=sea, 1=island
   turn: 1,
@@ -44,17 +46,120 @@ const el = {
   squadronList: document.getElementById('squadronList'),
   log: document.getElementById('log'),
   btnNextTurn: document.getElementById('btnNextTurn'),
-  btnModeSelect: document.getElementById('btnModeSelect'),
   btnModeMove: document.getElementById('btnModeMove'),
   btnModeLaunch: document.getElementById('btnModeLaunch'),
   btnRestart: document.getElementById('btnRestart'),
   btnNewMap: document.getElementById('btnNewMap'),
+  // Entrance/Lobby
+  viewEntrance: document.getElementById('view-entrance'),
+  viewLobby: document.getElementById('view-lobby'),
+  viewGame: document.getElementById('view-game'),
+  viewMatch: document.getElementById('view-match'),
+  usernameInput: document.getElementById('usernameInput'),
+  enterLobby: document.getElementById('enterLobby'),
+  lobbyUser: document.getElementById('lobbyUser'),
+  startGameBtn: document.getElementById('startGameBtn'),
+  // PvP lobby
+  tabButtons: Array.from(document.querySelectorAll('.tab[data-lobby]')),
+  lobbyPve: document.getElementById('lobby-pve'),
+  lobbyPvp: document.getElementById('lobby-pvp'),
+  btnCreateMatch: document.getElementById('btnCreateMatch'),
+  matchList: document.getElementById('matchList'),
+  // Match room
+  matchInfo: document.getElementById('matchInfo'),
+  btnLeaveMatch: document.getElementById('btnLeaveMatch'),
+  btnSubmitReady: document.getElementById('btnSubmitReady'),
+  matchCanvas: document.getElementById('matchCanvas'),
+  matchCarrierStatus: document.getElementById('matchCarrierStatus'),
+  matchSquadronList: document.getElementById('matchSquadronList'),
+  matchLog: document.getElementById('matchLog'),
+  matchHint: document.getElementById('matchHint'),
+  btnMatchModeMove: document.getElementById('btnMatchModeMove'),
+  btnMatchModeLaunch: document.getElementById('btnMatchModeLaunch'),
 };
 
 const ctx = el.canvas.getContext('2d');
 
-// === Init ===
-function init() {
+// === App Init / Navigation ===
+function showView(name) {
+  APP.view = name;
+  el.viewEntrance?.classList.toggle('hidden', name !== 'entrance');
+  el.viewLobby?.classList.toggle('hidden', name !== 'lobby');
+  el.viewGame?.classList.toggle('hidden', name !== 'game');
+  el.viewMatch?.classList.toggle('hidden', name !== 'match');
+  if (name === 'lobby') {
+    try { startLobbySSE(); } catch {}
+  }
+}
+
+function initApp() {
+  // Restore username if present
+  try {
+    const saved = localStorage.getItem('cw_username');
+    if (saved) APP.username = saved;
+  } catch {}
+  if (APP.username && el.usernameInput) el.usernameInput.value = APP.username;
+  showView('entrance');
+
+  // Entrance events
+  el.enterLobby?.addEventListener('click', () => {
+    const name = (el.usernameInput?.value || '').trim();
+    if (!name) { alert('ユーザ名を入力してください'); return; }
+    APP.username = name;
+    try { localStorage.setItem('cw_username', name); } catch {}
+    if (el.lobbyUser) el.lobbyUser.textContent = `ユーザ: ${APP.username}`;
+    showView('lobby');
+  });
+  el.usernameInput?.addEventListener('keydown', (e) => {
+    if (e.key === 'Enter') el.enterLobby?.click();
+  });
+
+  // Lobby interactions (only AI for now)
+  document.querySelectorAll('.opponent-card').forEach((card) => {
+    card.addEventListener('click', () => {
+      document.querySelectorAll('.opponent-card').forEach(c => c.classList.remove('selected'));
+      card.classList.add('selected');
+      APP.opponent = card.getAttribute('data-opponent') || 'AI';
+      APP.difficulty = card.getAttribute('data-difficulty') || 'normal';
+    });
+  });
+  el.startGameBtn?.addEventListener('click', () => {
+    // Future: send opponent/username to server if needed
+    startGameFlow();
+  });
+
+  // Lobby tab switching
+  el.tabButtons.forEach(btn => btn.addEventListener('click', () => {
+    el.tabButtons.forEach(b => b.classList.remove('active'));
+    btn.classList.add('active');
+    APP.lobbyMode = btn.getAttribute('data-lobby') || 'pve';
+    const pve = APP.lobbyMode === 'pve';
+    el.lobbyPve?.classList.toggle('hidden', !pve);
+    el.lobbyPvp?.classList.toggle('hidden', pve);
+    // Keep lobby SSE persistent regardless of tab
+    try { startLobbySSE(); } catch {}
+  }));
+
+  // PvP lobby actions
+  el.btnCreateMatch?.addEventListener('click', createMatch);
+
+  // Match room actions
+  el.btnLeaveMatch?.addEventListener('click', leaveMatchToLobby);
+  el.btnSubmitReady?.addEventListener('click', submitReady);
+  el.matchCanvas?.addEventListener('click', onMatchCanvasClick);
+  // Match modes
+  el.btnMatchModeMove?.addEventListener('click', () => setMatchMode('move'));
+  el.btnMatchModeLaunch?.addEventListener('click', () => setMatchMode('launch'));
+}
+
+function startGameFlow() {
+  showView('game');
+  if (!GAME_INITIALIZED) initGame();
+}
+
+// === Game Init ===
+function initGame() {
+  GAME_INITIALIZED = true;
   bindUI();
   computeHexMetrics();
   // サーバセッションを作成（サーバ側でマップ生成）
@@ -63,6 +168,446 @@ function init() {
     .catch((e)=>{ logMsg(`セッション初期化エラー: ${e && e.message ? e.message : e}`); });
   // 作戦開始ログは ensureSession 完了時に出す
   setHint();
+}
+
+// === PvP (Match) ===
+async function createMatch() {
+  const name = APP.username || 'Player';
+  try {
+    const res = await fetch('/v1/match/', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ mode: 'pvp', display_name: name }) });
+    if (!res.ok) throw new Error(`status ${res.status}`);
+    const json = await res.json();
+    APP.match = { id: json.match_id, token: json.player_token, side: json.side };
+    openMatchRoom();
+  } catch (e) {
+    alert('マッチ作成に失敗しました');
+  }
+}
+
+async function refreshMatchList() {
+  try {
+    const res = await fetch('/v1/match/');
+    if (!res.ok) throw new Error(`status ${res.status}`);
+    const json = await res.json();
+    renderMatchList(json.matches || []);
+  } catch (e) {
+    if (el.matchList) el.matchList.textContent = '取得に失敗しました';
+  }
+}
+
+function renderMatchList(matches) {
+  if (!el.matchList) return;
+  if (!matches.length) { el.matchList.classList.add('empty'); el.matchList.textContent = '参加待ちのマッチはありません'; return; }
+  el.matchList.classList.remove('empty');
+  el.matchList.innerHTML = matches.map(m => {
+    const open = m.has_open_slot && m.status !== 'over';
+    return `<div class="match-card">
+      <div>
+        <div class="mono">${m.match_id.slice(0,8)}</div>
+        <div class="meta">${m.status} ・ turn? ・ ${open ? '募集中' : '満席'}</div>
+      </div>
+      <div>
+        <button data-join="${m.match_id}" ${open ? '' : 'disabled'}>参加</button>
+      </div>
+    </div>`;
+  }).join('');
+  el.matchList.querySelectorAll('button[data-join]').forEach(btn => {
+    btn.addEventListener('click', () => joinMatch(btn.getAttribute('data-join')));
+  });
+}
+
+// Lobby SSE (PvP tab)
+let LOBBY_SSE = null;
+function startLobbySSE() {
+  stopLobbySSE();
+  try {
+    const es = new EventSource('/v1/match/events');
+    LOBBY_SSE = es;
+    es.onmessage = (ev) => {
+      try {
+        const payload = JSON.parse(ev.data);
+        // payload.matches should be an array when present — check explicitly
+        if (payload && Array.isArray(payload.matches)) {
+          renderMatchList(payload.matches);
+        }
+      } catch {}
+    };
+    es.addEventListener('list', (ev) => {
+      try { const js = JSON.parse(ev.data); renderMatchList(js.matches || []); } catch {}
+    });
+    es.onerror = () => {
+      handleSSEDisconnect('lobby');
+    };
+  } catch (e) {
+    if (el.matchList) el.matchList.textContent = 'ロビーSSE初期化エラー';
+  }
+}
+function stopLobbySSE() { try { if (LOBBY_SSE) LOBBY_SSE.close(); } catch {}; LOBBY_SSE = null; }
+
+// Unified SSE disconnect handler: alert and return to entrance
+function handleSSEDisconnect(context) {
+  try { stopMatchSSE(); } catch {}
+  try { stopLobbySSE(); } catch {}
+  // Best-effort: inform server we left the match
+  try {
+    if (APP.match) {
+      fetch(`/v1/match/${APP.match.id}/leave?token=${encodeURIComponent(APP.match.token)}`, { method: 'POST' }).catch(()=>{});
+    }
+  } catch {}
+  APP.match = null;
+  try { alert('通信がきれました'); } catch {}
+  showView('entrance');
+}
+
+async function joinMatch(matchId) {
+  const name = APP.username || 'Player';
+  try {
+    const res = await fetch(`/v1/match/${matchId}/join`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ display_name: name }) });
+    if (!res.ok) throw new Error(`status ${res.status}`);
+    const json = await res.json();
+    APP.match = { id: json.match_id, token: json.player_token, side: json.side };
+    openMatchRoom();
+  } catch (e) {
+    alert('参加に失敗しました');
+    refreshMatchList();
+  }
+}
+
+function openMatchRoom() {
+  // keep lobby SSE alive; open match SSE additionally
+  showView('match');
+  // 初期表示時点ではSSE未確立のため操作を一旦無効化
+  try { updateMatchControls(); } catch {}
+  startMatchSSE();
+}
+
+function leaveMatchToLobby() {
+  stopMatchSSE();
+  // best-effort tell server we're leaving this match
+  try {
+    if (APP.match) {
+      fetch(`/v1/match/${APP.match.id}/leave?token=${encodeURIComponent(APP.match.token)}`, { method: 'POST' }).catch(()=>{});
+    }
+  } catch {}
+  APP.match = null;
+  showView('lobby');
+  // ensure lobby SSE is running persistently
+  try { startLobbySSE(); } catch {}
+}
+
+async function updateMatchState() {
+  if (!APP.match) return;
+  try {
+    const res = await fetch(`/v1/match/${APP.match.id}/state?token=${encodeURIComponent(APP.match.token)}`);
+    if (!res.ok) throw new Error(`status ${res.status}`);
+    const st = await res.json();
+  // panels and topbar will be updated by updateMatchPanels()
+    if (st) { APP.matchState = st; renderMatchView(); updateMatchPanels(); updateMatchControls(); }
+  } catch (e) {
+    if (el.matchInfo) el.matchInfo.textContent = '状態取得に失敗しました';
+  }
+}
+
+async function submitReady() {
+  if (!APP.match) return;
+  // allow submit whenever match is active; server will resolve when both are present
+  try {
+    const s = APP.matchState || {};
+    if (!(s && s.status === 'active')) return;
+  } catch {}
+  try {
+    // send staged orders only (avoid overriding with empty {})
+    const staged = {};
+    if (APP.matchPending?.carrier_target) staged.carrier_target = APP.matchPending.carrier_target;
+    if (APP.matchPending?.launch_target) staged.launch_target = APP.matchPending.launch_target;
+    const res = await fetch(`/v1/match/${APP.match.id}/orders`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ player_token: APP.match.token, player_orders: staged }) });
+    if (!res.ok) throw new Error(`status ${res.status}`);
+    const js = await res.json();
+    // keep staged orders to allow resubmission/edit until解決（必要に応じて上書き可能）
+  } catch (e) {
+    alert('送信に失敗しました');
+  }
+}
+// === SSE for match ===
+function startMatchSSE() {
+  stopMatchSSE();
+  if (!APP.match) return;
+  try {
+    const url = `/v1/match/${APP.match.id}/events?token=${encodeURIComponent(APP.match.token)}`;
+    const es = new EventSource(url);
+    APP.matchSSE = es;
+    es.onmessage = (ev) => {
+      try {
+        const payload = JSON.parse(ev.data);
+        if (payload && payload.type === 'state') {
+          if (el.matchStatusLbl) el.matchStatusLbl.textContent = payload.status;
+          if (el.matchTurnLbl) el.matchTurnLbl.textContent = payload.turn;
+          if (el.matchWaitingLbl) el.matchWaitingLbl.textContent = payload.waiting_for;
+          APP.matchState = payload; renderMatchView();
+          updateMatchPanels(); updateMatchControls();
+        }
+      } catch {}
+    };
+    es.addEventListener('state', (ev) => {
+      try {
+        const js = JSON.parse(ev.data);
+        if (el.matchStatusLbl) el.matchStatusLbl.textContent = js.status;
+        if (el.matchTurnLbl) el.matchTurnLbl.textContent = js.turn;
+        if (el.matchWaitingLbl) el.matchWaitingLbl.textContent = js.waiting_for;
+        APP.matchState = js; renderMatchView(); updateMatchPanels(); updateMatchControls();
+      } catch {}
+    });
+    es.onerror = () => {
+      handleSSEDisconnect('match');
+    };
+  if (el.matchSideLbl) el.matchSideLbl.textContent = APP.match.side;
+    if (el.matchInfo) el.matchInfo.textContent = `side=${APP.match.side} / token=${APP.match.token.slice(0,8)}...`;
+  } catch (e) {
+    if (el.matchInfo) el.matchInfo.textContent = 'SSE初期化エラー';
+  }
+}
+
+function stopMatchSSE() {
+  try { if (APP.matchSSE) { APP.matchSSE.close(); } } catch {}
+  APP.matchSSE = null;
+}
+
+// === Match board rendering (simple grid) ===
+function renderMatchView() {
+  const st = APP.matchState; const cv = el.matchCanvas; if (!st || !cv) return;
+  const W = st.map_w || 30, H = st.map_h || 30;
+  // keep map grid if provided in snapshot
+  if (st.map) APP.matchMap = st.map;
+  const getTile = (x,y) => {
+    const m = APP.matchMap; if (!m) return 0; const row = m[y]; if (!row) return 0; const v = row[x]; return v||0;
+  };
+  if (!APP.matchHex || APP.matchHex.W !== W || APP.matchHex.H !== H || APP.matchHex.canvas !== cv) {
+    APP.matchHex = makeHexRenderer(cv, W, H, getTile);
+  }
+  else { APP.matchHex.getTileFn = getTile; }
+  const a = st.a && st.a.carrier || {}; const b = st.b && st.b.carrier || {};
+  APP.matchHex.renderBackground();
+  const mySide = (APP.match && APP.match.side) || 'A';
+  if (mySide === 'A') {
+    APP.matchHex.drawCarrier(a.x, a.y, getCss('--carrier')||'#4aa3ff', a.hp, 100);
+    APP.matchHex.drawCarrier(b.x, b.y, getCss('--enemy')||'#ff6464', b.hp, 100);
+  } else {
+    APP.matchHex.drawCarrier(b.x, b.y, getCss('--carrier')||'#4aa3ff', b.hp, 100);
+    APP.matchHex.drawCarrier(a.x, a.y, getCss('--enemy')||'#ff6464', a.hp, 100);
+  }
+  // pending move preview line
+  const mine = (mySide === 'A') ? a : b;
+  const pending = APP.matchPending?.carrier_target;
+  if (pending && mine && mine.x!=null && mine.y!=null) {
+    APP.matchHex.drawLine(mine.x, mine.y, pending.x, pending.y, 'rgba(106,212,255,0.5)');
+  }
+  // draw my squadrons (own side only)
+  const mySqs = (mySide === 'A') ? (st.a && st.a.squadrons) : (st.b && st.b.squadrons);
+  if (Array.isArray(mySqs)) {
+    for (const s of mySqs) {
+      if (!s || s.state === 'base' || s.state === 'lost') continue;
+      if (s.x == null || s.y == null) continue;
+      APP.matchHex.drawSquadron(s.x, s.y, getCss('--squad')||'#f2c14e', s.hp||40, 40);
+    }
+  }
+  // pending launch preview line (from carrier to target)
+  const pendingLaunch = APP.matchPending?.launch_target;
+  if (pendingLaunch && mine && mine.x!=null && mine.y!=null) {
+    APP.matchHex.drawLine(mine.x, mine.y, pendingLaunch.x, pendingLaunch.y, 'rgba(242,193,78,0.5)');
+  }
+}
+
+// Enable/disable controls based on match status and readiness
+function updateMatchControls() {
+  const s = APP.matchState || {};
+  const status = s.status;
+  const wait = s.waiting_for;
+  const disableAll = !APP.match || !s || status !== 'active';
+  // enable editing and submit while active; server gates resolution when both submitted
+  const canSubmit = !disableAll;
+  const canEdit = !disableAll;
+  if (el.btnMatchModeMove) el.btnMatchModeMove.disabled = disableAll || !canEdit;
+  if (el.btnMatchModeLaunch) el.btnMatchModeLaunch.disabled = disableAll || !canEdit;
+  if (el.btnSubmitReady) el.btnSubmitReady.disabled = disableAll || !canSubmit;
+}
+
+function onMatchCanvasClick(ev) {
+  if (!APP.match || !APP.matchState) return;
+  if (!APP.matchHex) return;
+  // respect editability
+  const s = APP.matchState || {};
+  const status = s.status;
+  const canEdit = (status === 'active');
+  const t = APP.matchHex.tileFromEvent(ev);
+  if (!t) return;
+  if (MATCH_MODE === 'move') {
+    if (!canEdit) return;
+    APP.matchPending = { ...(APP.matchPending||{}), carrier_target: { x: t.x, y: t.y } };
+    renderMatchView(); updateMatchPanels();
+  } else if (MATCH_MODE === 'launch') {
+    if (!canEdit) return;
+    APP.matchPending = { ...(APP.matchPending||{}), launch_target: { x: t.x, y: t.y } };
+    renderMatchView(); updateMatchPanels();
+  }
+  // Update topbar summary: show side, match status and waiting info
+  // topbar update moved to updateMatchPanels
+}
+
+async function submitOrders(orders) {
+  if (!APP.match) return;
+  try {
+    const res = await fetch(`/v1/match/${APP.match.id}/orders`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ player_token: APP.match.token, player_orders: orders||{} }) });
+    if (!res.ok) throw new Error(`status ${res.status}`);
+  } catch (e) {
+    alert('注文送信に失敗しました');
+  }
+}
+
+// === Match UI helpers ===
+let MATCH_MODE = 'move';
+function setMatchMode(m) {
+  MATCH_MODE = m;
+  if (el.btnMatchModeMove) el.btnMatchModeMove.classList.toggle('active', m === 'move');
+  if (el.btnMatchModeLaunch) el.btnMatchModeLaunch.classList.toggle('active', m === 'launch');
+  if (el.matchHint) el.matchHint.textContent = (m === 'move') ? '目的地をクリック（毎ターン自動移動）' : '目標地点をクリック（航続距離は未実装）';
+}
+
+function updateMatchPanels() {
+  if (!APP.matchState || !el.matchCarrierStatus) return;
+  const s = APP.matchState || {};
+  const a = s.a?.carrier || {}, b = s.b?.carrier || {};
+  const mySide = (APP.match?.side === 'A') ? 'A' : 'B';
+  const mine = (mySide === 'A') ? a : b;
+  // own squadrons for counts
+  const mySqs = (mySide === 'A') ? (s.a && s.a.squadrons) : (s.b && s.b.squadrons);
+  const sqArr = Array.isArray(mySqs) ? mySqs : [];
+  const baseAvail = sqArr.filter((x) => x && x.state === 'base' && (x.hp ?? 0) > 0);
+  const totalSlots = sqArr.length; // hangar 相当
+  const hpNow = (typeof mine.hp === 'number') ? mine.hp : '-';
+  const hpMax = CARRIER_MAX_HP;
+  const onboard = `${baseAvail.length} / ${totalSlots || '-'}`;
+  const hpLine = `${hpNow} / ${hpMax}`;
+  el.matchCarrierStatus.innerHTML = `
+    <div class="kv">
+      <div>HP</div><div>${hpLine}</div>
+      <div>航空部隊</div><div>${onboard}</div>
+    </div>
+  `;
+
+  // Squadrons panel (own side only)
+  if (el.matchSquadronList) {
+    const arr = sqArr;
+    if (arr.length === 0) {
+      el.matchSquadronList.textContent = '編隊はありません';
+    } else {
+      const rows = arr.map((sq) => {
+        const st = sq.state || '-';
+        const hpNow = (typeof sq.hp === 'number') ? sq.hp : '-';
+        const hpMax = SQUAD_MAX_HP;
+        // 表示名は SQ番号のみ（C1SQ1 -> SQ1）
+        let name = String(sq.id || '');
+        const m = name.match(/(SQ\d+)$/);
+        if (m) name = m[1];
+        const line1 = `<div class="kv"><div class="mono">${name}</div><div>${hpNow} / ${hpMax}</div></div>`;
+        const line2 = `<div class="kv"><div>状態</div><div>${st}</div></div>`;
+        return `${line1}${line2}`;
+      }).join('');
+      el.matchSquadronList.innerHTML = `<div class="list">${rows}</div>`;
+    }
+  }
+  // Status text mapping
+  try {
+    const side = APP.match?.side ? APP.match.side : '-';
+    let phase = '-';
+    if (s.status === 'waiting') {
+      phase = '参加受付中（相手の参加待ち）';
+    } else if (s.status === 'active') {
+      if (s.waiting_for === 'you') phase = 'オーダー受付中（あなたの入力待ち）';
+      else if (s.waiting_for === 'opponent') phase = '相手のオーダ完了まち';
+      else phase = 'ターン解決中';
+    } else if (s.status === 'over') {
+      let result = s.result || null;
+      if (!result) {
+        const myHp = mine && typeof mine.hp === 'number' ? mine.hp : null;
+        const opHp = opp && typeof opp.hp === 'number' ? opp.hp : null;
+        if (myHp != null && opHp != null) {
+          if (myHp <= 0 && opHp <= 0) result = 'draw';
+          else if (myHp <= 0) result = 'lose';
+          else if (opHp <= 0) result = 'win';
+        }
+      }
+      phase = result === 'win' ? 'ゲーム終了（あなたの勝ち）'
+           : result === 'lose' ? 'ゲーム終了（あなたの負け）'
+           : 'ゲーム終了（引き分け）';
+    }
+    if (el.matchInfo) el.matchInfo.textContent = `あなたは ${side} 側 • ${phase}`;
+  } catch (e) {}
+}
+
+function drawHpBarRect(x, y, cell, hp, max, color) {
+  if (hp == null || max == null) return;
+  const ctx = el.matchCanvas.getContext('2d');
+  const w = Math.max(12, Math.floor(cell * 0.7)), h = 4;
+  const cx = Math.round(x + (cell - w) / 2), cy = Math.round(y + 2);
+  const ratio = Math.max(0, Math.min(1, hp / max));
+  ctx.fillStyle = 'rgba(0,0,0,0.6)'; ctx.fillRect(cx, cy, w, h);
+  ctx.fillStyle = color; ctx.fillRect(cx, cy, Math.round(w * ratio), h);
+}
+
+// === Shared hex renderer (for PvP, non-invasive to PvE) ===
+function makeHexRenderer(canvas, W, H, getTileFn) {
+  // local renderer state
+  const SQ3 = Math.sqrt(3);
+  let HEX = 10, ORX = 0, ORY = 0;
+  const ctx = canvas.getContext('2d');
+  function compute() {
+    const sizeByW = canvas.width / (SQ3 * (W + 0.5));
+    HEX = Math.max(5, Math.floor(sizeByW));
+    const mapPixelW = SQ3 * HEX * (W + 0.5);
+    const mapPixelH = 1.5 * HEX * (H - 1) + 2 * HEX;
+    canvas.width = Math.ceil(mapPixelW);
+    canvas.height = Math.ceil(mapPixelH);
+    ORX = HEX; ORY = HEX;
+  }
+  compute();
+  function offsetToPixel(col, row) {
+    const x = HEX * (SQ3 * (col + 0.5 * (row & 1))) + ORX;
+    const y = HEX * (1.5 * row) + ORY; return [x, y];
+  }
+  function hexPolygon(cx, cy, size) {
+    const pts = []; for (let i=0;i<6;i++){ const ang = Math.PI/180*(60*i-30); pts.push([cx + size*Math.cos(ang), cy + size*Math.sin(ang)]);} return pts;
+  }
+  function renderBackground() {
+    ctx.clearRect(0,0,canvas.width, canvas.height);
+    ctx.fillStyle = getCss('--water'); ctx.fillRect(0,0,canvas.width, canvas.height);
+    for (let r=0;r<H;r++){
+      for (let c=0;c<W;c++){
+        const [px,py] = offsetToPixel(c,r); const poly = hexPolygon(px,py,HEX);
+        ctx.beginPath(); ctx.moveTo(poly[0][0], poly[0][1]); for (let i=1;i<poly.length;i++) ctx.lineTo(poly[i][0], poly[i][1]); ctx.closePath();
+        ctx.fillStyle = (getTileFn(c,r)===1) ? getCss('--island') : getCss('--water'); ctx.fill();
+        ctx.strokeStyle = getCss('--grid'); ctx.lineWidth = 1; ctx.stroke();
+      }
+    }
+  }
+  function drawCarrier(x,y,color,hp,max){ if(x==null||y==null) return; const [cx0,cy0]=offsetToPixel(x,y); const cx=cx0-HEX, cy=cy0-HEX; ctx.strokeStyle='rgba(0,0,0,0.85)'; ctx.lineWidth=4; ctx.strokeRect(cx+3,cy+3,HEX*2-6,HEX*2-6); ctx.fillStyle=color; ctx.fillRect(cx+4,cy+4,HEX*2-8,HEX*2-8); ctx.strokeStyle='rgba(255,255,255,0.35)'; ctx.lineWidth=1.5; ctx.strokeRect(cx+4,cy+4,HEX*2-8,HEX*2-8); drawHp(cx0,cy0,hp,max,color==='red'?'#ff9a9a':'#6ad4ff'); }
+  function drawSquadron(x,y,color,hp,max){ if(x==null||y==null) return; const [px,py]=offsetToPixel(x,y); const r=Math.max(4, Math.round(HEX*0.6));
+    ctx.beginPath(); ctx.arc(px, py, r+2, 0, Math.PI*2); ctx.strokeStyle='rgba(0,0,0,0.85)'; ctx.lineWidth=4; ctx.stroke();
+    ctx.beginPath(); ctx.arc(px, py, r, 0, Math.PI*2); ctx.fillStyle=color; ctx.fill();
+    ctx.strokeStyle='rgba(255,255,255,0.35)'; ctx.lineWidth=1.5; ctx.stroke();
+    const w=r*1.6, h=3; const x0=Math.round(px - w/2), y0=Math.round(py - r - 6); const ratio=Math.max(0,Math.min(1,(hp||max)/max));
+    ctx.fillStyle='rgba(0,0,0,0.6)'; ctx.fillRect(x0,y0,w,h); ctx.fillStyle='#f2c14e'; ctx.fillRect(x0,y0,Math.round(w*ratio),h);
+  }
+  function drawLine(x1,y1,x2,y2,color){ ctx.strokeStyle=color; ctx.lineWidth=2; ctx.beginPath(); const [sx,sy]=offsetToPixel(x1,y1); const [tx,ty]=offsetToPixel(x2,y2); ctx.moveTo(sx,sy); ctx.lineTo(tx,ty); ctx.stroke(); }
+  function drawHp(px,py,hp,max,color){ if(hp==null||max==null) return; const w=HEX*1.6,h=4; const x=Math.round(px - w/2), y=Math.round(py - HEX + 3); const ratio=Math.max(0,Math.min(1,hp/max)); ctx.fillStyle='rgba(0,0,0,0.6)'; ctx.fillRect(x,y,w,h); ctx.fillStyle=color; ctx.fillRect(x,y,Math.round(w*ratio),h); }
+  function tileFromEvent(e){ const rect=canvas.getBoundingClientRect(); const scaleX = canvas.width/rect.width, scaleY = canvas.height/rect.height; const mx=(e.clientX-rect.left)*scaleX, my=(e.clientY-rect.top)*scaleY; const [qf, rf] = pixelToAxial(mx,my); const { q, r } = axialRound(qf, rf); const off = axialToOffset(q,r); const c=off.col, rr=off.row; if (c<0||rr<0||c>=W||rr>=H) return null; return {x:c,y:rr}; }
+  function pixelToAxial(px,py){ const x=(px-ORX)/HEX, y=(py-ORY)/HEX; const q=(Math.sqrt(3)/3)*x - (1/3)*y; const r=(2/3)*y; return [q,r]; }
+  function axialToCube(q,r){ return { x:q, z:r, y:-q-r }; }
+  function cubeToAxial(x,y,z){ return { q:x, r:z }; }
+  function cubeRound(x,y,z){ let rx=Math.round(x), ry=Math.round(y), rz=Math.round(z); const dx=Math.abs(rx-x), dy=Math.abs(ry-y), dz=Math.abs(rz-z); if (dx>dy && dx>dz) rx = -ry - rz; else if (dy>dz) ry = -rx - rz; else rz = -rx - ry; return { x:rx, y:ry, z:rz }; }
+  function axialRound(q,r){ const cr=cubeRound(q, -q - r, r); const ar=cubeToAxial(cr.x, cr.y, cr.z); return { q: ar.q, r: ar.r }; }
+  function axialToOffset(q,r){ const col = q + ((r - (r & 1)) >> 1); const row = r; return { col, row };
+  }
+  return { canvas, W, H, renderBackground, drawCarrier, drawSquadron, tileFromEvent, drawLine, getTileFn };
 }
 
 function bindUI() {
@@ -74,7 +619,7 @@ function bindUI() {
     nextTurn();
   });
 
-  const modeButtons = [el.btnModeSelect, el.btnModeMove, el.btnModeLaunch];
+  const modeButtons = [el.btnModeMove, el.btnModeLaunch].filter(Boolean);
   modeButtons.forEach((b) => b.addEventListener('click', () => setMode(b.dataset.mode)));
 
   el.btnRestart.addEventListener('click', () => restartGame('restart'));
@@ -629,7 +1174,9 @@ async function ensureSession() {
   const res = await fetch('/v1/session/', {
     method: 'POST', headers: { 'Content-Type': 'application/json' },
     // mapは送らず、サーバ側で生成
-    body: JSON.stringify({ })
+    body: JSON.stringify({
+      config: { difficulty: APP.difficulty || 'normal', time_ms: 50 }
+    })
   });
   if (!res.ok) throw new Error(`session create failed: ${res.status}`);
   const data = await res.json();
@@ -658,7 +1205,7 @@ function buildSessionStepRequest() {
   const player_orders = buildPlayerOrders();
   return {
     player_orders,
-    config: { difficulty: 'normal', time_ms: 50 },
+    config: { difficulty: APP.difficulty || 'normal', time_ms: 50 },
   };
 }
 
@@ -820,7 +1367,9 @@ function restartGame(kind) {
   // UI
   enableControls();
   document.querySelectorAll('[data-mode]').forEach((b) => b.classList.remove('active'));
-  document.getElementById('btnModeSelect').classList.add('active');
+  // btnModeSelect removed; set default mode button active via available buttons
+  const firstModeBtn = document.querySelector('.controls button[data-mode]');
+  if (firstModeBtn) firstModeBtn.classList.add('active');
   setHint();
   clearLog();
   logMsg(kind === 'newmap' ? '新しい海域で作戦開始: ターン1' : 'リスタート: ターン1');
@@ -843,4 +1392,4 @@ function logMsg(msg) {
 function escapeHtml(s) { return s.replace(/[&<>"']/g, (c) => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;','\'':'&#39;'}[c])); }
 
 // start
-window.addEventListener('DOMContentLoaded', init);
+window.addEventListener('DOMContentLoaded', initApp);

@@ -48,6 +48,12 @@ try:
 except Exception as e:
     print(f"Failed to load Session router: {e}")
 
+try:
+    from server.routers.match_router import router as match_router
+    app.include_router(match_router, prefix="/v1/match", tags=["match"])
+except Exception as e:
+    print(f"Failed to load Match router: {e}")
+
 
 if __name__ == "__main__":
     uvicorn.run(app, host="0.0.0.0", port=8000)

@@ -8,7 +8,7 @@ APP_MODULE="server.main:app"
 HOST="0.0.0.0"
 PORT="8000"
 WORKERS="1"
-RELOAD="${RELOAD:-}"
+RELOAD="1"
 
 ROOT_DIR="$(cd "$(dirname "$0")" && pwd)"
 LOG_DIR="$ROOT_DIR/logs"

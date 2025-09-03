@@ -10,7 +10,7 @@ import json
 from pathlib import Path
 from typing import Tuple
 
-from server.services.session import Session, EnemyState, CarrierState, EnemyMemory, EnemyAIState
+from server.services.session import Session, PlayerState, CarrierState, EnemyMemory, EnemyAIState
 from server.services.session import _distance_field_hex, _offset_neighbors
 
 
@@ -70,11 +70,8 @@ def run_map_file(path: Path, stop_range: int = 0) -> dict:
     game_map = head["map"]
     # Build a neutral session (no units needed for path calc)
     sess = Session(
-        id="test",
+        session_id="test",
         map=game_map,
-        enemy_state=EnemyState(carrier=CarrierState(id="E", x=0, y=0), squadrons=[]),
-        player_state=EnemyState(carrier=CarrierState(id="P", x=0, y=0), squadrons=[]),
-        enemy_memory=EnemyMemory(enemy_ai=EnemyAIState()),
         rand_seed=None,
         config=None,
     )

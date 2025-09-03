@@ -26,6 +26,7 @@ from server.schemas import (
     PlayerObservation,
     SquadronLight,
 )
+from server.services.hexmap import HexArray
 from server.services.ai import plan_orders
 from server.utils.audit import audit_write, maplog_write
 
@@ -560,12 +561,18 @@ def _find_path_hex(
 
 
 def _is_occupied(sess: Session, pos:Position, ignore_id: Optional[str] = None, player_obs: Optional[PlayerObservation] = None) -> bool:
-    # enemy carrier
+    # enemy carrier (respect ignore_id when caller is the enemy carrier itself)
     if sess.enemy_state.carrier.pos == pos:
-        return True
-    # player carrier
+        if ignore_id is not None and sess.enemy_state.carrier.id == ignore_id:
+            pass
+        else:
+            return True
+    # player carrier (respect ignore_id when caller is the player carrier itself)
     if sess.player_state.carrier.pos == pos:
-        return True
+        if ignore_id is not None and sess.player_state.carrier.id == ignore_id:
+            pass
+        else:
+            return True
     # enemy squadrons
     for s in sess.enemy_state.squadrons:
         if s.id == ignore_id:
@@ -1160,33 +1167,9 @@ def _validate_sea_connectivity(sess: Session):
     INF = 10 ** 8
     reached = 0
     for spos in sea:
-        if 0 <= spos.y < H and 0 <= spos.x < W and dist[y][x] < INF:
+        if 0 <= spos.y < H and 0 <= spos.x < W and dist[spos.y][spos.x] < INF:
             reached += 1
     return reached == sea_total, sea_total, reached
-
-
-class HexArray:
-
-    def __init__( self, width:int, height: int ):
-        self.m = [[0 for _ in range(width)] for __ in range(height)]
-    
-    def dump(self):
-        """キャラクタベースのヘックスマップをプリントする。
-        偶数/奇数行をインデントして六角形グリッドの視覚的なズレを表現します。
-        0 を海 (.)、非0 を陸 (#) として表示します。
-        """
-        yy = "  "
-        for x, col in enumerate(self.m[0]):
-            yy += f" {x:2d}"
-        print(yy)
-        for y, row in enumerate(self.m):
-            # 奇数行を少しインデント（見やすさ向上）
-            yy = f"{y:2d}: "
-            prefix = "  " if y % 2 == 1 else ""
-            chars = []
-            for cell in row:
-                chars.append(f"{cell}")
-            print(yy + prefix + "  ".join(chars))
 
 # ==== Server-side map generation helpers ====
 def _generate_connected_map(width: int, height: int, *, blobs: int = 10, rng: Optional[random.Random] = None):
