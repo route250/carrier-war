@@ -135,6 +135,7 @@ class UnitState(BaseModel):
     side: str
     pos: Position
     hp: int
+    max_hp: int
     speed: int
     vision: int
     target: Optional[Position] = None
@@ -178,6 +179,7 @@ class UnitState(BaseModel):
 
 class CarrierState(UnitState):
     hp: int = CARRIER_MAX_HP
+    max_hp: int = CARRIER_MAX_HP
     speed: int = 2
     vision: int = VISION_CARRIER
     hangar: int = 2
@@ -186,6 +188,7 @@ class CarrierState(UnitState):
 class SquadronState(UnitState):
     pos: Position = Position.invalid()
     hp: int = SQUAD_MAX_HP
+    max_hp: int = SQUAD_MAX_HP
     speed: int = 4
     vision: int = VISION_SQUADRON
     state: Literal["base", "outbound", "engaging", "returning", "lost"] = "base"

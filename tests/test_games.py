@@ -41,13 +41,13 @@ def gamex():
         )
     ]
 
-    # result = board.turn_forward(eorders)
+    result = board.turn_forward(eorders)
 
-    # for side, report in result.items():
-    #     print(f"--- Logs for side {side} ---")
-    #     for entry in report.dump():
-    #         print(entry)
-    #     print()
+    for side, report in result.items():
+        print(f"--- Logs for side {side} ---")
+        for entry in report.dump():
+            print(entry)
+        print()
 
     orders = [
         PlayerOrders(
@@ -55,7 +55,7 @@ def gamex():
             launch_target=Position(x=4,y=4)
         ),
         PlayerOrders(
-            carrier_target=None,
+            carrier_target=Position(x=0,y=0),
             launch_target=None
         )
     ]

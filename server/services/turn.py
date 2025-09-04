@@ -1,6 +1,7 @@
 
 from server.schemas import SessionStepRequest, PlayerOrders
 from server.schemas import Position, UnitState, CarrierState, SquadronState, IntelPath, IntelReport
+from server.schemas import SQUAD_MAX_HP, CARRIER_MAX_HP
 from server.services.hexmap import HexArray
 import random
 
@@ -26,6 +27,14 @@ def next_step( hexmap:HexArray, units: list[UnitHolder], current: Position, targ
             return pos
     return None
 
+# 攻撃判定: 編隊からのダメージと、空母からの対空(AA)
+def scaled_damage(hp: int, max_hp:int, base: int) -> int:
+    hp = hp if hp is not None else max_hp
+    scale = max(0.0, min(1.0, hp / float(max_hp)))
+    variance = round(base * 0.2)
+    raw = base + (0 if variance == 0 else random.randint(-variance, variance))
+    return max(0, round(raw * scale))
+
 class GameBord:
     def __init__(self, hexmap: HexArray, units_list:list[list[UnitState]]):
         if len(units_list) == 0:
@@ -35,13 +44,50 @@ class GameBord:
         if hexmap is None:
             raise ValueError("Map cannot be None.")
 
-        self.turn:int = 0
+        self.turn:int = 1
         self.hexmap = hexmap
         self.units_list:list[UnitHolder] = []
         for side, bbb in zip(["A","B"], units_list):
             for unit in bbb:
+                if isinstance(unit, CarrierState):
+                    unit.target = self.get_start_position(unit.pos)
                 self.units_list.append(UnitHolder(side, unit))
         self.intel: dict[str,IntelReport] = {"A":IntelReport(side="A",turn=0), "B":IntelReport(side="B",turn=0)}
+
+    @property
+    def W(self) -> int:
+        return self.hexmap.W
+    @property
+    def H(self) -> int:
+        return self.hexmap.H
+    def get_start_position(self, pos: Position) -> Position|None:
+        hrange = int(self.hexmap.H / 3)+1
+        hmin = max(0, pos.y - hrange)
+        hmax = min(self.hexmap.H - 1, pos.y + hrange)
+        hlist = list(range(hmin, hmax+1))
+        wrange = int(self.hexmap.W / 3)+1
+        wmin = max(0, pos.x - wrange)
+        wmax = min(self.hexmap.W - 1, pos.x + wrange)
+
+        while len(hlist) > 0:
+            i = random.randint(0, len(hlist)-1)
+            y = hlist.pop(i)
+            wlist = list(range(wmin, wmax+1))
+            while len(wlist) > 0:
+                i = random.randint(0, len(wlist)-1)
+                x = wlist.pop(i)
+                if self.hexmap.get(x,y) == 0:
+                    return Position(x=x, y=y)
+        return None
+
+    def get_carrier_by_side(self, side: str) -> CarrierState|None:
+        for u in self.units_list:
+            if u.side == side and isinstance(u.unit, CarrierState):
+                return u.unit
+        return None
+
+    def get_squadrons_by_side(self, side: str) -> list[SquadronState]:
+        return [u.unit for u in self.units_list if u.side == side and isinstance(u.unit, SquadronState)]
 
     def turn_forward(self, orders:list[PlayerOrders]) -> dict[str,IntelReport]:
         logs:dict[str,list[str]] = {}
@@ -63,7 +109,6 @@ class GameBord:
                     if u.side == side and isinstance(u.unit, CarrierState):
                         u.unit.target = order.carrier_target
                         break
-        self.turn += 1
         # 判定フェーズ
         for u in self.units_list:
             if u.unit.is_active() and isinstance(u.unit, SquadronState) and u.unit.state=='engaging':
@@ -72,11 +117,27 @@ class GameBord:
                 if ec:
                     u.ticks = u.unit.speed  # 攻撃完了まで動けない
                     ec.ticks = ec.unit.speed  # 攻撃完了まで動けない
-                    # ToDo 攻撃判定
-                    pass
-                    logs.setdefault(u.side, []).append(f"{u.unit.id}({u.unit.pos.x},{u.unit.pos.y}) finished attack and is returning")
+
+                    aa = scaled_damage(ec.unit.hp,ec.unit.max_hp, 20)
+                    dmg = scaled_damage(u.unit.hp,u.unit.max_hp, 25)
+                    # 空母へダメージ適用
+                    ec.unit.hp = max(0, ec.unit.hp - dmg)
+                    if ec.unit.hp <= 0:
+                        # 撃沈
+                        logs.setdefault(u.side, []).append(f"{ec.unit.id}({ec.unit.pos.x},{ec.unit.pos.y}) was sunk by {u.unit.id}({u.unit.pos.x},{u.unit.pos.y})")
+                        ec.unit.target = None
+                        ec.unit.pos = Position.invalid()
+                    # 編隊へAA適用
+                    u.unit.hp = max(0, u.unit.hp - aa)
+                    if u.unit.hp <= 0:
+                        # 撃墜
+                        logs.setdefault(u.side, []).append(f"{u.unit.id}({u.unit.pos.x},{u.unit.pos.y}) was shot down by AA")
+                        u.unit.state = 'lost'
+                        u.unit.pos = Position.invalid()
+                        u.unit.target = None
+                    else:
+                        logs.setdefault(u.side, []).append(f"{u.unit.id}({u.unit.pos.x},{u.unit.pos.y}) finished attack and is returning")
                 else:
-                    pass
                     logs.setdefault(u.side, []).append(f"{u.unit.id}({u.unit.pos.x},{u.unit.pos.y}) lost its target and is returning")
                 # 攻撃完了したら帰還状態に変更
                 u.unit.state = 'returning'
@@ -187,4 +248,10 @@ class GameBord:
                     if ir_path.turn < self.turn - 3:
                         del it.intel[ir_path.unit_id]
             self.intel[side] = report
+        self.turn += 1
         return self.intel
+
+    def is_over(self) -> bool:
+        a_hp = next( (u.unit.hp for u in self.units_list if u.side == "A" and isinstance(u.unit, CarrierState)), 0)
+        b_hp = next( (u.unit.hp for u in self.units_list if u.side == "B" and isinstance(u.unit, CarrierState)), 0)
+        return a_hp <= 0 or b_hp <= 0

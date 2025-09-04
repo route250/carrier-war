@@ -1175,15 +1175,6 @@ def _generate_connected_map(width: int, height: int, *, blobs: int = 10, rng: Op
     return map.copy_as_list()
 
 
-def _carve_sea(m: list, pos: Position, r: int):
-    H = len(m)
-    W = len(m[0]) if H > 0 else 0
-    for y in range(H):
-        for x in range(W):
-            if pos.hex_distance(Position(x=x, y=y) ) <= r:
-                m[y][x] = 0
-
-
 def _game_status(sess: Session) -> GameStatus:
     # Determine game over conditions
     if sess.enemy_state.carrier.hp <= 0:
