@@ -722,8 +722,8 @@ store = MatchStore()
 # ---------- Internal helpers ----------
 def _new_player_state(side:str, cx: int, cy: int) -> PlayerState:
     id_prefix = "C1" if side == "A" else "E1"
-    carrier = CarrierState(id=f"{id_prefix}", side=side, pos=Position(x=cx, y=cy), hp=100, speed=2, vision=4)
-    squadrons = [SquadronState(id=f"{id_prefix}SQ{i+1}", side=side, pos=Position.invalid(), state='base', hp=40, speed=4, vision=3) for i in range(carrier.hangar)]
+    carrier = CarrierState(id=f"{id_prefix}", side=side, pos=Position(x=cx, y=cy))
+    squadrons = [SquadronState(id=f"{id_prefix}SQ{i+1}", side=side, pos=Position.invalid()) for i in range(carrier.hangar)]
     return PlayerState(side=side,carrier=carrier, squadrons=squadrons)
 
 

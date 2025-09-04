@@ -9,6 +9,12 @@ except Exception:  # fallback for environments without pydantic v2
 
 INF:int = 10**8
 
+SQUAD_MAX_HP = 40
+CARRIER_MAX_HP = 100
+VISION_SQUADRON = 5
+VISION_CARRIER = 4
+SQUADRON_RANGE = 22
+
 class Position(BaseModel,frozen=True):
 
     x: int
@@ -45,6 +51,9 @@ class Position(BaseModel,frozen=True):
     def invalid() -> 'Position':
         return Position(x=-1, y=-1)
 
+    def is_valid(self) -> bool:
+        return self.x>=0 and self.y>=0
+    
     @staticmethod
     def new(p1:'int|tuple[int,int]|Position', p2:int|None=None) -> 'Position':
         if isinstance(p1, Position):
@@ -168,11 +177,18 @@ class UnitState(BaseModel):
                 return None
 
 class CarrierState(UnitState):
+    hp: int = CARRIER_MAX_HP
+    speed: int = 2
+    vision: int = VISION_CARRIER
     hangar: int = 2
 
 
 class SquadronState(UnitState):
-    state: Literal["base", "outbound", "engaging", "returning", "lost"]
+    pos: Position = Position.invalid()
+    hp: int = SQUAD_MAX_HP
+    speed: int = 4
+    vision: int = VISION_SQUADRON
+    state: Literal["base", "outbound", "engaging", "returning", "lost"] = "base"
 
     def is_active(self) -> bool:
         return super().is_active() and self.state != "lost" and self.state != 'base'
@@ -425,9 +441,28 @@ class IntelPath(BaseModel):
     side: str
     unit_id: str
     turn: int
-    path: List[Position] = []
+    p1: Position
+    p2: Position
 
 class IntelReport(BaseModel):
     """索敵報告"""
+    turn: int
     side: str
-    paths: dict[str,IntelPath] = {}
+    logs: List[str] = []
+    units: List[UnitState] = []
+    intel: dict[str,IntelPath] = {}
+
+    def dump(self):
+        yield f"side: {self.side} turn: {self.turn}"
+        for log in self.logs:
+            yield f"  log: {log}"
+        for unit in self.units:
+            if isinstance(unit,CarrierState):
+                yield f"  unit: {unit.id} pos: {unit.pos} hp: {unit.hp}"
+            elif isinstance(unit,SquadronState):
+                loc = f"{unit.state}"
+                if unit.pos.is_valid():
+                    loc = loc + f"({unit.pos.x},{unit.pos.y})"
+                yield f"  unit: {unit.id} {loc} hp: {unit.hp}"
+        for path in self.intel.values():
+            yield f"  intel: {path.unit_id} from {path.p1} to {path.p2}"

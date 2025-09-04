@@ -5,6 +5,7 @@ from collections import deque
 from dataclasses import dataclass, field
 from typing import Dict, Optional
 
+from server.schemas import SQUADRON_RANGE, VISION_SQUADRON, VISION_CARRIER, SQUAD_MAX_HP, CARRIER_MAX_HP
 from server.schemas import (
     GameStatus,
     SessionCreateRequest,
@@ -32,11 +33,7 @@ from server.utils.audit import audit_write, maplog_write
 
 
 # ==== Server-side game helpers (enemy side only) ====
-SQUAD_MAX_HP = 40
-CARRIER_MAX_HP = 100
-VISION_SQUADRON = 5
-VISION_CARRIER = 4
-SQUADRON_RANGE = 22
+
 
 
 class Session:
@@ -54,12 +51,12 @@ class Session:
         self.rand_seed: Optional[int] = rand_seed
         self.config: Optional[dict] = config
 
-        enemy_carrier = CarrierState(side="B",id="E1", pos=Position(x=26, y=26), hp=CARRIER_MAX_HP, speed=2, vision=4)
-        enemy_squadrons = [SquadronState(side="B",id=f"ESQ{i+1}", pos=Position.invalid(), state='base', hp=SQUAD_MAX_HP, speed=4, vision=3) for i in range(enemy_carrier.hangar)]
+        enemy_carrier = CarrierState(side="B",id="E1", pos=Position(x=26, y=26))
+        enemy_squadrons = [SquadronState(side="B",id=f"ESQ{i+1}") for i in range(enemy_carrier.hangar)]
         self.enemy_state: PlayerState = PlayerState(side="B",carrier=enemy_carrier, squadrons=enemy_squadrons)
 
-        player_carrier = CarrierState(side="A",id="C1", pos=Position(x=3, y=3), hp=CARRIER_MAX_HP, speed=2, vision=4)
-        player_squadrons = [SquadronState(side="B",id=f"SQ{i+1}", pos=Position.invalid(), state='base', hp=SQUAD_MAX_HP, speed=4, vision=3) for i in range(player_carrier.hangar)]
+        player_carrier = CarrierState(side="A",id="C1", pos=Position(x=3, y=3))
+        player_squadrons = [SquadronState(side="B",id=f"SQ{i+1}") for i in range(player_carrier.hangar)]
         self.player_state: PlayerState = PlayerState(side="A",carrier=player_carrier, squadrons=player_squadrons)
         # Ensure starting positions are on sea (carve small sea around if necessary)
         _carve_sea(map, self.player_state.carrier.pos, 2)

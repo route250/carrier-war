@@ -20,17 +20,11 @@ class UnitHolder:
         self.path = [self.unit.pos] if self.unit.is_active() else []
         self.intel = {}
 
-def next_step( hexmap:HexArray, units: list[UnitHolder], current: Position, target: Position) -> Position|None:
-    for pos in hexmap.neighbors_by_gradient(current, target):
+def next_step( hexmap:HexArray, units: list[UnitHolder], current: Position, target: Position, *, ignore_land:bool = False) -> Position|None:
+    for pos in hexmap.neighbors_by_gradient(current, target, ignore_land=ignore_land):
         if all( not ou.unit.is_active() or pos != ou.unit.pos for ou in units):
             return pos
     return None
-
-class Order:
-    def __init__(self, side:str, carrier_target: Position|None, launch_target: Position|None):
-        self.side = side
-        self.carrier_target = carrier_target
-        self.launch_target = launch_target
 
 class GameBord:
     def __init__(self, hexmap: HexArray, units_list:list[list[UnitState]]):
@@ -47,11 +41,11 @@ class GameBord:
         for side, bbb in zip(["A","B"], units_list):
             for unit in bbb:
                 self.units_list.append(UnitHolder(side, unit))
-        self.intel: dict[str,IntelReport] = {"A":IntelReport(side="A"), "B":IntelReport(side="B")}
+        self.intel: dict[str,IntelReport] = {"A":IntelReport(side="A",turn=0), "B":IntelReport(side="B",turn=0)}
 
-    def turn_forward(self, orders:list[PlayerOrders]) -> dict[str,list[str]]:
+    def turn_forward(self, orders:list[PlayerOrders]) -> dict[str,IntelReport]:
         logs:dict[str,list[str]] = {}
-        if len(self.units_list) != len(orders):
+        if len(orders) != 2:
             raise ValueError("Units list and orders list must have the same length.")
 
         # reset
@@ -69,6 +63,7 @@ class GameBord:
                     if u.side == side and isinstance(u.unit, CarrierState):
                         u.unit.target = order.carrier_target
                         break
+        self.turn += 1
         # 判定フェーズ
         for u in self.units_list:
             if u.unit.is_active() and isinstance(u.unit, SquadronState) and u.unit.state=='engaging':
@@ -110,13 +105,15 @@ class GameBord:
                                 # 空母に到達したら基地状態に変更
                                 logs.setdefault(u.side, []).append(f"{u.unit.id}({u.unit.pos.x},{u.unit.pos.y}) returned to carrier {cu.unit.id}({cu.unit.pos.x},{cu.unit.pos.y})")
                                 u.unit.state = 'base'
-                                u.unit.pos = cu.unit.pos
+                                u.unit.pos = Position.invalid()
                                 u.path.append(u.unit.pos)
                                 u.unit.target = None
                                 u.ticks = u.unit.speed
+                                cu.ticks = cu.unit.speed # 着艦時には動けない
                                 continue
                             u.unit.target = cu.unit.pos
-                    next_pos = next_step(self.hexmap, self.units_list, u.unit.pos, u.unit.target)
+                    ignore_land = isinstance(u.unit, SquadronState)
+                    next_pos = next_step(self.hexmap, self.units_list, u.unit.pos, u.unit.target, ignore_land=ignore_land)
                     if next_pos is not None:
                         u.unit.pos = next_pos
                         u.path.append(u.unit.pos)
@@ -160,9 +157,9 @@ class GameBord:
                             launch_pos = next((cu.unit.pos for cu in self.units_list if cu.side == side and isinstance(cu.unit, CarrierState)), None)
                             if launch_pos is not None:
                                 # ターゲットに近い位置に発艦
-                                pos = next_step(self.hexmap, self.units_list, launch_pos, order.launch_target)
+                                pos = next_step(self.hexmap, self.units_list, launch_pos, order.launch_target,ignore_land=True)
                                 if pos is not None:
-                                    logs.setdefault(u.side, []).append(f"{u.unit.id}({u.unit.pos.x},{u.unit.pos.y}) launched to towards {order.launch_target}")
+                                    logs.setdefault(u.side, []).append(f"{u.unit.id}({launch_pos.x},{launch_pos.y}) launched to towards {order.launch_target}")
                                     u.unit.pos = pos
                                     u.path.append(u.unit.pos)
                                     u.unit.state = 'outbound'
@@ -171,19 +168,23 @@ class GameBord:
                                     break
                     if launched:
                         break
-        # 敵に発見された情報を更新
-        for u in self.units_list:
-            if u.intel:
-                poist_list = [p for t,p in sorted(u.intel.items())]
-                report = self.intel.get(u.side)
-                if report is None:
-                    report = IntelReport(side=u.side, paths={})
-                    self.intel[u.side] = report
-                ir_path = IntelPath( side=u.side, unit_id=u.unit.id, turn=self.turn, path=poist_list)
-                report.paths[ir_path.unit_id] = ir_path
-        # 古い情報を削除
-        for report in self.intel.values():
-            for ir_path in report.paths.values():
-                if ir_path.turn < self.turn - 3:
-                    del report.paths[ir_path.unit_id]
-        return logs
+        # ----
+        for i, side in enumerate(["A","B"]):
+            report = IntelReport(side=side, turn=self.turn)
+            report.logs = logs.get(side, [])
+            # 自軍ユニット情報
+            report.units = [u.unit for u in self.units_list if u.side == side]
+            # 索敵結果
+            for u in self.units_list:
+                if u.side != side and u.unit.is_active() and u.intel:
+                    poist_list = [p for t,p in sorted(u.intel.items())]
+                    ir_path = IntelPath( side=u.side, unit_id=u.unit.id, turn=self.turn, p1=poist_list[0], p2=poist_list[-1])
+                    report.intel[ir_path.unit_id] = ir_path
+
+            # 古い情報を削除
+            for it in self.intel.values():
+                for ir_path in it.intel.values():
+                    if ir_path.turn < self.turn - 3:
+                        del it.intel[ir_path.unit_id]
+            self.intel[side] = report
+        return self.intel
