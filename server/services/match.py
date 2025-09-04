@@ -137,8 +137,8 @@ class MatchStore:
         W = 30; H = 30
         m.map = _generate_connected_map(W, H)
         # Place carriers and ensure sea around them
-        m.a_state = _new_player_state("C1", 3, 3)
-        m.b_state = _new_player_state("E1", W-4, H-4)
+        m.a_state = _new_player_state("A", 3, 3)
+        m.b_state = _new_player_state("B", W-4, H-4)
         _carve_sea(m.map, m.a_state.carrier.pos, 2)
         _carve_sea(m.map, m.b_state.carrier.pos, 2)
         m.turn = 1
@@ -720,10 +720,11 @@ class MatchStore:
 store = MatchStore()
 
 # ---------- Internal helpers ----------
-def _new_player_state(id_prefix: str, cx: int, cy: int) -> PlayerState:
-    carrier = CarrierState(id=f"{id_prefix}", pos=Position(x=cx, y=cy), hp=100, speed=2, vision=4)
-    squadrons = [SquadronState(id=f"{id_prefix}SQ{i+1}", pos=Position.invalid(), state='base', hp=40, speed=4, vision=3) for i in range(carrier.hangar)]
-    return PlayerState(carrier=carrier, squadrons=squadrons)
+def _new_player_state(side:str, cx: int, cy: int) -> PlayerState:
+    id_prefix = "C1" if side == "A" else "E1"
+    carrier = CarrierState(id=f"{id_prefix}", side=side, pos=Position(x=cx, y=cy), hp=100, speed=2, vision=4)
+    squadrons = [SquadronState(id=f"{id_prefix}SQ{i+1}", side=side, pos=Position.invalid(), state='base', hp=40, speed=4, vision=3) for i in range(carrier.hangar)]
+    return PlayerState(side=side,carrier=carrier, squadrons=squadrons)
 
 
 def _make_session_view(map_grid: list, me: PlayerState, op: PlayerState):

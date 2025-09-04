@@ -95,6 +95,14 @@
   - `server/services/session.py` の `_validate_sea_connectivity` における `dist[y][x]` の未定義参照を `dist[spos.y][spos.x]` に修正。
   - 影響: マップ連結性検証時の到達数カウントの正確性向上（例外は元々握っているため致命ではない）。
 
+- 不具合修正（サーバ/描画）
+  - `server/services/hexmap.py` の `draw()` が pointy-top の odd-q レイアウト相当になっており、クライアント（`static/main.js`）の pointy-top odd-r と不一致だった。
+  - 修正内容: client と同じ式に統一。
+    - 中心座標: `cx = sqrt(3)*r*(col + 0.5*(row&1)) + r`, `cy = 1.5*r*row + r`
+    - SVGサイズ: `width = sqrt(3)*r*(W + 0.5)`, `height = 1.5*r*(H - 1) + 2*r`
+    - 六角形頂点角度: `60*i - 30`（pointy-top）で client と一致
+  - 影響: サーバ生成SVGの六角グリッドがクライアントの表示と完全一致。座標ラベル表示も正しい位置に。
+
 - ロビーSSEとマッチSSEの仕様（最小）
   - マッチSSE: 接続直後に`event: state`で初期スナップショットをpush、その後は更新差分を`data:`で配信。15秒間隔のハートビート（コメント行）を送出。
   - ロビーSSE: 接続直後に`event: list`で一覧をpush。作成/参加/離脱でロビーにブロードキャスト。

@@ -1,3 +1,4 @@
+import math
 from typing import List, Optional, Literal, Dict, Any
 from pydantic import BaseModel, Field
 try:
@@ -9,6 +10,10 @@ except Exception:  # fallback for environments without pydantic v2
 INF:int = 10**8
 
 class Position(BaseModel,frozen=True):
+
+    x: int
+    y: int
+
     def __le__(self, other):
         if not isinstance(other, Position):
             return NotImplemented
@@ -27,8 +32,6 @@ class Position(BaseModel,frozen=True):
         if not isinstance(other, Position):
             return NotImplemented
         return (self.x, self.y) < (other.x, other.y)
-    x: int
-    y: int
 
     def __hash__(self):
         return hash((self.x, self.y))
@@ -107,11 +110,20 @@ class Position(BaseModel,frozen=True):
         for dx, dy in deltas:
             yield Position(x=self.x + dx, y=self.y + dy)
 
+    def angle_to(self, other: 'Position') -> float:
+        """
+        selfからotherへの角度（ラジアン）を返す。
+        """
+        dx = other.x - self.x
+        dy = other.y - self.y
+        return math.atan2(dy, dx)
+
 class TrackPos(Position, frozen=True):
     range:int
 
 class UnitState(BaseModel):
     id: str
+    side: str
     pos: Position
     hp: int
     speed: int
@@ -167,6 +179,7 @@ class SquadronState(UnitState):
 
 
 class PlayerState(BaseModel):
+    side:str
     carrier: CarrierState
     squadrons: List[SquadronState] = []
     # Server-authoritative persistent move target for the player's carrier
@@ -406,3 +419,15 @@ class MatchOrdersResponse(BaseModel):
     accepted: bool = True
     status: MatchStatus
     turn: int
+
+class IntelPath(BaseModel):
+    """索敵結果"""
+    side: str
+    unit_id: str
+    turn: int
+    path: List[Position] = []
+
+class IntelReport(BaseModel):
+    """索敵報告"""
+    side: str
+    paths: dict[str,IntelPath] = {}

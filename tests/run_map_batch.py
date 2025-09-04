@@ -10,6 +10,7 @@ import json
 from pathlib import Path
 from typing import Tuple
 
+from server.schemas import Position
 from server.services.session import Session, PlayerState, CarrierState, EnemyMemory, EnemyAIState
 from server.services.session import _distance_field_hex, _offset_neighbors
 
@@ -17,7 +18,7 @@ from server.services.session import _distance_field_hex, _offset_neighbors
 def gradient_path(sess: Session, start: Tuple[int, int], goal: Tuple[int, int], *, pass_islands: bool, stop_range: int = 0, max_steps: int = 2000):
     dist = _distance_field_hex(
         sess,
-        goal,
+        Position.new(goal),
         pass_islands=pass_islands,
         ignore_id=None,
         player_obs=None,

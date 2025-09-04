@@ -26,7 +26,7 @@ from server.schemas import (
     PlayerObservation,
     SquadronLight,
 )
-from server.services.hexmap import HexArray
+from server.services.hexmap import HexArray, generate_connected_map as hex_generate_connected_map
 from server.services.ai import plan_orders
 from server.utils.audit import audit_write, maplog_write
 
@@ -42,7 +42,7 @@ SQUADRON_RANGE = 22
 class Session:
     def __init__(self,
                  session_id: str,
-                 map: list,
+                 map: list[list],
                  rand_seed: Optional[int] = None,
                  config: Optional[dict] = None,
                ):
@@ -54,13 +54,13 @@ class Session:
         self.rand_seed: Optional[int] = rand_seed
         self.config: Optional[dict] = config
 
-        enemy_carrier = CarrierState(id="E1", pos=Position(x=26, y=26), hp=CARRIER_MAX_HP, speed=2, vision=4)
-        enemy_squadrons = [SquadronState(id=f"ESQ{i+1}", pos=Position.invalid(), state='base', hp=SQUAD_MAX_HP, speed=4, vision=3) for i in range(enemy_carrier.hangar)]
-        self.enemy_state: PlayerState = PlayerState(carrier=enemy_carrier, squadrons=enemy_squadrons)
+        enemy_carrier = CarrierState(side="B",id="E1", pos=Position(x=26, y=26), hp=CARRIER_MAX_HP, speed=2, vision=4)
+        enemy_squadrons = [SquadronState(side="B",id=f"ESQ{i+1}", pos=Position.invalid(), state='base', hp=SQUAD_MAX_HP, speed=4, vision=3) for i in range(enemy_carrier.hangar)]
+        self.enemy_state: PlayerState = PlayerState(side="B",carrier=enemy_carrier, squadrons=enemy_squadrons)
 
-        player_carrier = CarrierState(id="C1", pos=Position(x=3, y=3), hp=CARRIER_MAX_HP, speed=2, vision=4)
-        player_squadrons = [SquadronState(id=f"SQ{i+1}", pos=Position.invalid(), state='base', hp=SQUAD_MAX_HP, speed=4, vision=3) for i in range(player_carrier.hangar)]
-        self.player_state: PlayerState = PlayerState(carrier=player_carrier, squadrons=player_squadrons)
+        player_carrier = CarrierState(side="A",id="C1", pos=Position(x=3, y=3), hp=CARRIER_MAX_HP, speed=2, vision=4)
+        player_squadrons = [SquadronState(side="B",id=f"SQ{i+1}", pos=Position.invalid(), state='base', hp=SQUAD_MAX_HP, speed=4, vision=3) for i in range(player_carrier.hangar)]
+        self.player_state: PlayerState = PlayerState(side="A",carrier=player_carrier, squadrons=player_squadrons)
         # Ensure starting positions are on sea (carve small sea around if necessary)
         _carve_sea(map, self.player_state.carrier.pos, 2)
         _carve_sea(map, self.enemy_state.carrier.pos, 2)
@@ -1146,7 +1146,7 @@ def _enemy_sees_player_carrier(sess: Session) -> Optional[Position]:
         if sq.hex_distance(pc) <= sq.vision:
             return pc.pos.model_copy()
     return None
-    
+
 
 def _validate_sea_connectivity(sess: Session):
     # BFS-like reachability over sea using distance field from an arbitrary sea tile
@@ -1173,25 +1173,9 @@ def _validate_sea_connectivity(sess: Session):
 
 # ==== Server-side map generation helpers ====
 def _generate_connected_map(width: int, height: int, *, blobs: int = 10, rng: Optional[random.Random] = None):
-    r = rng or random.Random()
-    for _attempt in range(60):
-        m = HexArray(width,height).m
-        for _ in range(blobs):
-            cx = r.randint(2, max(2, width - 3))
-            cy = r.randint(2, max(2, height - 3))
-            rad = r.randint(1, 3)
-            for dy in range(-rad, rad + 1):
-                for dx in range(-rad, rad + 1):
-                    if dx * dx + dy * dy <= rad * rad:
-                        x = max(0, min(width - 1, cx + dx))
-                        y = max(0, min(height - 1, cy + dy))
-                        m[y][x] = 1
-        # quick connectivity check using a temp session
-        tmp_sess = Session(session_id="tmp", map=m )
-        ok, sea_total, sea_reached = _validate_sea_connectivity(tmp_sess)
-        if ok:
-            return m
-    return m
+    map = HexArray(width, height)
+    hex_generate_connected_map(map, blobs=blobs)
+    return map.copy_as_list()
 
 
 def _carve_sea(m: list, pos: Position, r: int):
