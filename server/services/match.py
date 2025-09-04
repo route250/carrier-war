@@ -84,6 +84,16 @@ class Match:
             return "B"
         return None
 
+    def _resolve_turn_minimal(self) -> None:
+        # Move carriers towards targets if provided
+        orders = [self.side_a.orders or PlayerOrders(), self.side_b.orders or PlayerOrders()]
+        self.last_report = self.map.turn_forward(orders)  # use existing turn logic to apply orders
+        # Check game over condition (any carrier destroyed)
+        try:
+            if self.map.is_over():
+                self.status = "over"
+        except Exception:
+            pass
 
 class MatchStore:
     def __init__(self) -> None:
@@ -100,7 +110,7 @@ class MatchStore:
         # Place carriers and ensure sea around them
         a_units = _new_player_state("A", 3,3 )
         b_units = _new_player_state("B", W-4, H-4 )
-        bord = GameBord(map, [a_units, b_units])
+        bord = GameBord(map, [a_units, b_units], log_id=mid)
         m = Match(match_id=mid, mode=req.mode or "pvp", map=bord, config=(req.config.dict() if req.config else None))
         # creator occupies side A by default
         token = str(uuid.uuid4())
@@ -147,18 +157,6 @@ class MatchStore:
         # reset intel memory
         m.intel_a = SideIntel()
         m.intel_b = SideIntel()
-
-    # --- internal: resolve a minimal turn using carrier move orders only ---
-    def _resolve_turn_minimal(self, m: Match) -> None:
-        # Move carriers towards targets if provided
-        orders = [m.side_a.orders or PlayerOrders(), m.side_b.orders or PlayerOrders()]
-        m.last_report = m.map.turn_forward(orders)  # use existing turn logic to apply orders
-        # Check game over condition (any carrier destroyed)
-        try:
-            if m.map.is_over():
-                m.status = "over"
-        except Exception:
-            pass
 
     def join(self, match_id: str, req: MatchJoinRequest) -> MatchJoinResponse:
         m = self._matches[match_id]
@@ -207,7 +205,7 @@ class MatchStore:
         m = self._matches[match_id]
         side = m.side_for_token(token) if token else None
         payload = self._build_state_payload(m, viewer_side=side)
-        payload["map"] = m.map
+        payload["map"] = m.map.get_map_array()
         return payload
 
     # --- SSE Subscribe/Unsubscribe and broadcast ---
@@ -427,7 +425,7 @@ class MatchStore:
             # Resolve turn only when both sides submitted (ready)
             if m.status == "active" and (m.side_a.orders is not None and m.side_b.orders is not None):
                 try:
-                    self._resolve_turn_minimal(m)
+                    m._resolve_turn_minimal()
                 except Exception:
                     # even if resolution fails, advance to avoid deadlock
                     pass

@@ -134,3 +134,5 @@
 - 起動: `./start_server.sh start`
 - ログ: `./start_server.sh logs -f`
 - 手動テスト方針: ブラウザ2枚で同一マッチに参加→入替で注文→解決確認。
+ - PvPマッチ監査ログ: `logs/matches/<timestamp>_<match_id>.log` にJSONLで出力（`server/services/turn.py`）。
+   - 記録例: `turn_start`, `order_carrier_target`, `launch`, `engage`, `attack`, `shot_down`, `sunk`, `return`, `move`(空母のみ), `turn_end`。

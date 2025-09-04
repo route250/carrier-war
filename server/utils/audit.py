@@ -1,10 +1,11 @@
 import json
 import os
 from datetime import datetime
-from typing import Any, Dict
+from typing import Any, Dict, Optional
 
 # Maintain per-session filename base so all writes go to the same timestamped file
 _SESSION_FILE_BASE: Dict[str, str] = {}
+_MATCH_FILE_BASE: Dict[str, str] = {}
 
 
 def _ensure_dir(path: str) -> None:
@@ -18,6 +19,15 @@ def _file_base_for(session_id: str) -> str:
     ts = datetime.now().strftime("%Y%m%d-%H%M%S")
     base = f"{ts}_{session_id}"
     _SESSION_FILE_BASE[session_id] = base
+    return base
+
+def _match_file_base_for(match_id: str) -> str:
+    """Return a stable '<timestamp>_<match_id>' base for this process (matches)."""
+    if match_id in _MATCH_FILE_BASE:
+        return _MATCH_FILE_BASE[match_id]
+    ts = datetime.now().strftime("%Y%m%d-%H%M%S")
+    base = f"{ts}_{match_id}"
+    _MATCH_FILE_BASE[match_id] = base
     return base
 
 
@@ -55,5 +65,27 @@ def maplog_write(session_id: str, record: Dict[str, Any]) -> None:
     try:
         with open(log_path, "a", encoding="utf-8") as f:
             f.write(json.dumps(record, ensure_ascii=False) + "\n")
+    except Exception:
+        pass
+
+
+def match_write(match_id: Optional[str], record: Dict[str, Any]) -> None:
+    """Best-effort JSONL write for per-match logs.
+
+    - `match_id` が未指定(None/空)なら即return。
+    - 例外は全て握りつぶす（本処理への影響を避ける）。
+    """
+    if not match_id:
+        return
+    try:
+        base_dir = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..", "logs", "matches"))
+        _ensure_dir(base_dir)
+        rec = dict(record)
+        rec.setdefault("ts", datetime.utcnow().isoformat() + "Z")
+        rec.setdefault("match_id", match_id)
+        base = _match_file_base_for(match_id)
+        log_path = os.path.join(base_dir, f"{base}.log")
+        with open(log_path, "a", encoding="utf-8") as f:
+            f.write(json.dumps(rec, ensure_ascii=False) + "\n")
     except Exception:
         pass
