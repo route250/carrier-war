@@ -27,16 +27,8 @@ from server.schemas import (
     SquadronState,
     Position,
     PlayerOrders,
-    SideIntel,
 )
-from server.services.session import (
-    _find_path_hex,
-    _gradient_full_path,
-    _nearest_sea_tile,
-    _find_free_adjacent,
-    _scaled_damage,
-    SQUADRON_RANGE,
-)
+
 from server.services.turn import GameBord
 
 # Debug flag: enable when running tests or when env var CARRIER_WAR_DEBUG is set
@@ -64,11 +56,7 @@ class Match:
     created_at: int = field(default_factory=lambda: int(time.time()))
     side_a: PlayerSlot = field(default_factory=PlayerSlot)
     side_b: PlayerSlot = field(default_factory=PlayerSlot)
-    # Per-side intel memory (what A knows about B, and B about A)
-    intel_a: SideIntel = field(default_factory=SideIntel)
-    intel_b: SideIntel = field(default_factory=SideIntel)
     lock: Lock = field(default_factory=Lock, repr=False)
-    subscribers: list[asyncio.Queue[str]] = field(default_factory=list, repr=False)
     subscribers_map: dict[asyncio.Queue[str], Optional[str]] = field(default_factory=dict, repr=False)
     last_report: Optional[dict[str, IntelReport]] = None
 
@@ -146,6 +134,23 @@ class Match:
             result_dict["result"] = result
         return result_dict
 
+
+    def _broadcast_state(self) -> None:
+        try:
+            if len(self.subscribers_map) == 0:
+                return
+            subs = dict(self.subscribers_map)
+            for q,token in subs.items():
+                try:
+                    side = self.side_for_token(token) if token else None
+                    payload = self.build_state_payload(viewer_side=side)
+                    data = json.dumps(payload, ensure_ascii=False)
+                    q.put_nowait(data)
+                except Exception:
+                    pass
+        except Exception:
+            pass
+
 class MatchStore:
     def __init__(self) -> None:
         self._matches: Dict[str, Match] = {}
@@ -168,14 +173,10 @@ class MatchStore:
         m.side_a.token = token
         m.side_a.name = req.display_name
         self._matches[mid] = m
-        # initialize minimal world state
-        m.intel_a = SideIntel()
-        m.intel_b = SideIntel()
+
         # broadcast lobby list update
-        try:
-            self._broadcast_lobby_list()
-        except Exception:
-            pass
+        self._broadcast_lobby_list()
+
         return MatchCreateResponse(
             match_id=mid,
             player_token=token,
@@ -200,15 +201,6 @@ class MatchStore:
             )
         return MatchListResponse(matches=items)
 
-    # --- internal: initialize world for a match ---
-    def _init_world(self, m: Match) -> None:
-
-
-
-        # reset intel memory
-        m.intel_a = SideIntel()
-        m.intel_b = SideIntel()
-
     def join(self, match_id: str, req: MatchJoinRequest) -> MatchJoinResponse:
         m = self._matches[match_id]
         with m.lock:
@@ -229,15 +221,9 @@ class MatchStore:
             if m.side_a.token and m.side_b.token:
                 m.status = "active"
             # broadcast lobby list update
-            try:
-                self._broadcast_lobby_list()
-            except Exception:
-                pass
+            self._broadcast_lobby_list()
             # broadcast updated match state so creator gets immediately notified
-            try:
-                self._broadcast_state(m)
-            except Exception:
-                pass
+            m._broadcast_state()
             return MatchJoinResponse(match_id=m.match_id, player_token=token, side=side, status=m.status)
 
     def state(self, match_id: str, token: Optional[str]) -> MatchStateResponse:
@@ -257,32 +243,29 @@ class MatchStore:
             b=payload.get("b"),
         )
 
+    # --- SSE Subscribe/Unsubscribe and broadcast ---
+    def subscribe(self, match_id: str, token: Optional[str]) -> asyncio.Queue[str]:
+        """ start sse session """
+        m = self._matches[match_id]
+        q: asyncio.Queue[str] = asyncio.Queue(maxsize=100)
+        with m.lock:
+            m.subscribers_map[q] = token
+        return q
+
     def snapshot(self, match_id: str, token: Optional[str] = None) -> dict:
+        """ first data for sse session"""
         m = self._matches[match_id]
         side = m.side_for_token(token) if token else None
         payload = m.build_state_payload(viewer_side=side)
         payload["map"] = m.map.get_map_array()
         return payload
 
-    # --- SSE Subscribe/Unsubscribe and broadcast ---
-    def subscribe(self, match_id: str, token: Optional[str]) -> asyncio.Queue[str]:
-        m = self._matches[match_id]
-        q: asyncio.Queue[str] = asyncio.Queue(maxsize=100)
-        with m.lock:
-            m.subscribers.append(q)
-            m.subscribers_map[q] = token
-        return q
-
     def unsubscribe(self, match_id: str, q: asyncio.Queue[str]) -> None:
+        """ end of sse session """
         m = self._matches.get(match_id)
         if not m:
             return
         with m.lock:
-            # remove subscriber
-            try:
-                m.subscribers.remove(q)
-            except ValueError:
-                pass
             token = m.subscribers_map.pop(q, None)
             # If this subscriber was tied to a player token and no other
             # subscriptions remain for that token, consider that player left
@@ -305,32 +288,16 @@ class MatchStore:
                             del self._matches[m.match_id]
                         except Exception:
                             pass
-                        try:
-                            self._broadcast_lobby_list()
-                        except Exception:
-                            pass
+                        self._broadcast_lobby_list()
                         return
                     # broadcast lobby list and updated state to remaining subscribers
-                    try:
-                        self._broadcast_lobby_list()
-                    except Exception:
-                        pass
-                    try:
-                        self._broadcast_state(m)
-                    except Exception:
-                        pass
+                    self._broadcast_lobby_list()
 
-    def _broadcast(self, m: Match, payload: dict) -> None:
-        data = json.dumps(payload, ensure_ascii=False)
-        subs = list(m.subscribers)
-        for q in subs:
-            try:
-                q.put_nowait(data)
-            except Exception:
-                pass
+                    m._broadcast_state()
 
     # --- Lobby SSE ---
     def lobby_subscribe(self) -> asyncio.Queue[str]:
+        """ start lobby sse session """
         q: asyncio.Queue[str] = asyncio.Queue(maxsize=100)
         self._lobby_subs.append(q)
         return q
@@ -342,14 +309,17 @@ class MatchStore:
             pass
 
     def _broadcast_lobby_list(self) -> None:
-        payload = {"type": "list", "matches": self.list().model_dump().get("matches", [])}
-        data = json.dumps(payload, ensure_ascii=False)
-        subs = list(self._lobby_subs)
-        for q in subs:
-            try:
-                q.put_nowait(data)
-            except Exception:
-                pass
+        try:
+            payload = {"type": "list", "matches": self.list().model_dump().get("matches", [])}
+            data = json.dumps(payload, ensure_ascii=False)
+            subs = list(self._lobby_subs)
+            for q in subs:
+                try:
+                    q.put_nowait(data)
+                except Exception:
+                    pass
+        except Exception:
+            pass
 
     def leave(self, match_id: str, token: str) -> None:
         m = self._matches.get(match_id)
@@ -371,32 +341,12 @@ class MatchStore:
                     del self._matches[m.match_id]
                 except Exception:
                     pass
-                try:
-                    self._broadcast_lobby_list()
-                except Exception:
-                    pass
+                self._broadcast_lobby_list()
                 return
             # otherwise broadcast updates
-            try:
-                self._broadcast_lobby_list()
-            except Exception:
-                pass
-            try:
-                self._broadcast_state(m)
-            except Exception:
-                pass
+            self._broadcast_lobby_list()
 
-    def _broadcast_state(self, m: Match) -> None:
-        subs = list(m.subscribers)
-        for q in subs:
-            try:
-                token = m.subscribers_map.get(q)
-                side = m.side_for_token(token) if token else None
-                payload = m.build_state_payload(viewer_side=side)
-                data = json.dumps(payload, ensure_ascii=False)
-                q.put_nowait(data)
-            except Exception:
-                pass
+            m._broadcast_state()
 
     def submit_orders(self, match_id: str, req: MatchOrdersRequest) -> MatchOrdersResponse:
         m = self._matches[match_id]
@@ -416,19 +366,11 @@ class MatchStore:
                 except Exception:
                     # even if resolution fails, advance to avoid deadlock
                     pass
-                # clear orders for next turn
-                m.side_a.orders = None
-                m.side_b.orders = None
-                try:
-                    self._broadcast_state(m)
-                except Exception:
-                    pass
-            else:
-                # one side submitted; broadcast waiting state
-                try:
-                    self._broadcast_state(m)
-                except Exception:
-                    pass
+            # clear orders for next turn
+            m.side_a.orders = None
+            m.side_b.orders = None
+            m._broadcast_state()
+
         return MatchOrdersResponse(accepted=True, status=m.status, turn=m.map.turn)
 
 
