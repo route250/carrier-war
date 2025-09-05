@@ -130,6 +130,15 @@ class Match:
             "a": a_units,
             "b": b_units,
         }
+        # Attach per-viewer logs (previous turn) if available
+        try:
+            if viewer_side in ("A", "B") and self.last_report is not None:
+                rep = self.last_report.get(viewer_side)
+                if rep and getattr(rep, "logs", None):
+                    # クライアント側で重複追加を避けるため、常に最新ターンのstateに含めるだけにする
+                    result_dict["logs"] = list(rep.logs)
+        except Exception:
+            pass
         if result:
             result_dict["result"] = result
         return result_dict
@@ -366,9 +375,9 @@ class MatchStore:
                 except Exception:
                     # even if resolution fails, advance to avoid deadlock
                     pass
-            # clear orders for next turn
-            m.side_a.orders = None
-            m.side_b.orders = None
+                # clear orders for next turn
+                m.side_a.orders = None
+                m.side_b.orders = None
             m._broadcast_state()
 
         return MatchOrdersResponse(accepted=True, status=m.status, turn=m.map.turn)

@@ -14,7 +14,7 @@ const SQUADRON_RANGE = 22;    // 航空機の航続距離（空母からの最�
 // === State ===
 const SQUAD_MAX_HP = 40;
 const CARRIER_MAX_HP = 100;
-const APP = { view: 'entrance', username: '', opponent: 'AI', difficulty: 'easy', lobbyMode: 'pve', match: null, matchSSE: null, matchHex: null, matchPending: { carrier_target: null, launch_target: null } };
+const APP = { view: 'entrance', username: '', opponent: 'AI', difficulty: 'easy', lobbyMode: 'pve', match: null, matchSSE: null, matchHex: null, matchPending: { carrier_target: null, launch_target: null }, matchLoggedUpToTurn: 0 };
 let GAME_INITIALIZED = false;
 const state = {
   map: [], // 0=sea, 1=island
@@ -278,6 +278,8 @@ function openMatchRoom() {
   showView('match');
   // 初期表示時点ではSSE未確立のため操作を一旦無効化
   try { updateMatchControls(); } catch {}
+  // ログ表示を初期化
+  try { clearMatchLog(); APP.matchLoggedUpToTurn = 0; } catch {}
   startMatchSSE();
 }
 
@@ -385,6 +387,27 @@ function renderMatchView() {
   else { APP.matchHex.getTileFn = getTile; }
   const a = st.a && st.a.carrier || {}; const b = st.b && st.b.carrier || {};
   APP.matchHex.renderBackground();
+  // Visibility overlay (PvP): server-provided per-side turn_visible under a/b
+  try {
+    const mySide = (APP.match && APP.match.side) || 'A';
+    const mineObj = (mySide === 'A') ? st.a : st.b;
+    const visList = (mineObj && Array.isArray(mineObj.turn_visible)) ? mineObj.turn_visible : [];
+    // Normalize to Set("x,y") accepting both "x,y" and "x=..,y=.." formats
+    const visSet = new Set();
+    for (const v of visList) {
+      if (typeof v === 'string') {
+        const m = v.match(/(-?\d+)\s*,\s*(-?\d+)/);
+        if (m) { visSet.add(`${parseInt(m[1],10)},${parseInt(m[2],10)}`); continue; }
+        const m2 = v.match(/x\s*=\s*(-?\d+)\s*,\s*y\s*=\s*(-?\d+)/i);
+        if (m2) { visSet.add(`${parseInt(m2[1],10)},${parseInt(m2[2],10)}`); continue; }
+      } else if (v && typeof v === 'object' && typeof v.x === 'number' && typeof v.y === 'number') {
+        visSet.add(`${v.x},${v.y}`);
+      }
+    }
+    if (visSet.size > 0 && APP.matchHex.renderVisibilityOverlay) {
+      APP.matchHex.renderVisibilityOverlay(visSet);
+    }
+  } catch {}
   const mySide = (APP.match && APP.match.side) || 'A';
   if (mySide === 'A') {
     APP.matchHex.drawCarrier(a.x, a.y, getCss('--carrier')||'#4aa3ff', a.hp, 100);
@@ -416,6 +439,27 @@ function renderMatchView() {
       // 航空機: 保留オーダー（発艦）よりもサーバtargetを表示（保留はキャリア→目標で別線を描画）
       if (s.target && s.target.x!=null && s.target.y!=null) {
         APP.matchHex.drawLine(s.x, s.y, s.target.x, s.target.y, 'rgba(242,193,78,0.4)');
+      }
+    }
+  }
+  // draw enemy squadrons (visible/intel this turn): 赤＋菱形
+  const oppSqs = (mySide === 'A') ? (st.b && st.b.squadrons) : (st.a && st.a.squadrons);
+  if (Array.isArray(oppSqs)) {
+    for (const s of oppSqs) {
+      // 相手側は to_payload() 由来で今ターン発見したもののみ x,y を持つ
+      if (!s || s.x == null || s.y == null) continue;
+      // 敵編隊の現在地（形: 菱形 / 色: 赤）
+      if (APP.matchHex.drawDiamond) {
+        APP.matchHex.drawDiamond(s.x, s.y, getCss('--enemy')||'#ff6464');
+      } else {
+        APP.matchHex.drawSquadron(s.x, s.y, getCss('--enemy')||'#ff6464', s.hp||40, 40);
+      }
+      // 索敵で得た移動痕跡（first -> last）
+      if (s.x0 != null && s.y0 != null) {
+        // 視認性向上のためやや濃い白線
+        if (s.x0 !== s.x || s.y0 !== s.y) {
+          APP.matchHex.drawLine(s.x0, s.y0, s.x, s.y, 'rgba(255,255,255,0.65)');
+        }
       }
     }
   }
@@ -490,6 +534,13 @@ function handleMatchStateUpdate(nextState) {
     if (prevTurn != null && nextTurn != null && nextTurn > prevTurn) {
       // ターンが進んだので保留中のオーダーをクリア
       APP.matchPending = { carrier_target: null, launch_target: null };
+    }
+    // PvPログ: サーバstateに含まれるlogsを、同一ターンにつき1回だけ追記
+    if (typeof nextTurn === 'number' && nextTurn > (APP.matchLoggedUpToTurn || 0)) {
+      if (Array.isArray(nextState.logs)) {
+        for (const m of nextState.logs) matchLogMsg(m);
+      }
+      APP.matchLoggedUpToTurn = nextTurn;
     }
   } catch {}
   APP.matchState = nextState;
@@ -570,6 +621,22 @@ function updateMatchPanels() {
   } catch (e) {}
 }
 
+// === PvP Log ===
+function clearMatchLog() {
+  if (!el.matchLog) return;
+  el.matchLog.innerHTML = '';
+}
+
+function matchLogMsg(msg) {
+  if (!el.matchLog) return;
+  const ts = new Date().toLocaleTimeString('ja-JP', { hour12: false });
+  const line = document.createElement('div');
+  line.className = 'entry';
+  line.innerHTML = `<span class="ts">[${ts}]</span>${escapeHtml(String(msg))}`;
+  el.matchLog.appendChild(line);
+  el.matchLog.scrollTop = el.matchLog.scrollHeight;
+}
+
 function drawHpBarRect(x, y, cell, hp, max, color) {
   if (hp == null || max == null) return;
   const ctx = el.matchCanvas.getContext('2d');
@@ -615,6 +682,23 @@ function makeHexRenderer(canvas, W, H, getTileFn) {
       }
     }
   }
+  // Visibility overlay: fill a soft highlight on tiles contained in visSet (keys: "x,y")
+  function renderVisibilityOverlay(visSet, color='rgba(255,255,255,0.14)') {
+    if (!visSet || visSet.size === 0) return;
+    for (let r = 0; r < H; r++) {
+      for (let c = 0; c < W; c++) {
+        if (!visSet.has(`${c},${r}`)) continue;
+        const [px, py] = offsetToPixel(c, r);
+        const poly = hexPolygon(px, py, HEX);
+        ctx.beginPath();
+        ctx.moveTo(poly[0][0], poly[0][1]);
+        for (let i = 1; i < poly.length; i++) ctx.lineTo(poly[i][0], poly[i][1]);
+        ctx.closePath();
+        ctx.fillStyle = color;
+        ctx.fill();
+      }
+    }
+  }
   function drawCarrier(x,y,color,hp,max){ if(x==null||y==null) return; const [cx0,cy0]=offsetToPixel(x,y); const cx=cx0-HEX, cy=cy0-HEX; ctx.strokeStyle='rgba(0,0,0,0.85)'; ctx.lineWidth=4; ctx.strokeRect(cx+3,cy+3,HEX*2-6,HEX*2-6); ctx.fillStyle=color; ctx.fillRect(cx+4,cy+4,HEX*2-8,HEX*2-8); ctx.strokeStyle='rgba(255,255,255,0.35)'; ctx.lineWidth=1.5; ctx.strokeRect(cx+4,cy+4,HEX*2-8,HEX*2-8); drawHp(cx0,cy0,hp,max,color==='red'?'#ff9a9a':'#6ad4ff'); }
   function drawSquadron(x,y,color,hp,max){ if(x==null||y==null) return; const [px,py]=offsetToPixel(x,y); const r=Math.max(4, Math.round(HEX*0.6));
     ctx.beginPath(); ctx.arc(px, py, r+2, 0, Math.PI*2); ctx.strokeStyle='rgba(0,0,0,0.85)'; ctx.lineWidth=4; ctx.stroke();
@@ -622,6 +706,16 @@ function makeHexRenderer(canvas, W, H, getTileFn) {
     ctx.strokeStyle='rgba(255,255,255,0.35)'; ctx.lineWidth=1.5; ctx.stroke();
     const w=r*1.6, h=3; const x0=Math.round(px - w/2), y0=Math.round(py - r - 6); const ratio=Math.max(0,Math.min(1,(hp||max)/max));
     ctx.fillStyle='rgba(0,0,0,0.6)'; ctx.fillRect(x0,y0,w,h); ctx.fillStyle='#f2c14e'; ctx.fillRect(x0,y0,Math.round(w*ratio),h);
+  }
+  function drawDiamond(x,y,color){ if(x==null||y==null) return; const [px,py]=offsetToPixel(x,y); const r=Math.max(4, Math.round(HEX*0.6));
+    const pts=[[px,py-r],[px+r,py],[px,py+r],[px-r,py]];
+    ctx.beginPath(); ctx.moveTo(pts[0][0], pts[0][1]); for (let i=1;i<pts.length;i++) ctx.lineTo(pts[i][0], pts[i][1]); ctx.closePath();
+    // halo
+    ctx.strokeStyle='rgba(0,0,0,0.85)'; ctx.lineWidth=4; ctx.stroke();
+    // fill
+    ctx.fillStyle=color; ctx.fill();
+    // border
+    ctx.strokeStyle='rgba(255,255,255,0.35)'; ctx.lineWidth=1.5; ctx.stroke();
   }
   function drawLine(x1,y1,x2,y2,color){ ctx.strokeStyle=color; ctx.lineWidth=2; ctx.beginPath(); const [sx,sy]=offsetToPixel(x1,y1); const [tx,ty]=offsetToPixel(x2,y2); ctx.moveTo(sx,sy); ctx.lineTo(tx,ty); ctx.stroke(); }
   function drawHp(px,py,hp,max,color){ if(hp==null||max==null) return; const w=HEX*1.6,h=4; const x=Math.round(px - w/2), y=Math.round(py - HEX + 3); const ratio=Math.max(0,Math.min(1,hp/max)); ctx.fillStyle='rgba(0,0,0,0.6)'; ctx.fillRect(x,y,w,h); ctx.fillStyle=color; ctx.fillRect(x,y,Math.round(w*ratio),h); }
@@ -633,7 +727,7 @@ function makeHexRenderer(canvas, W, H, getTileFn) {
   function axialRound(q,r){ const cr=cubeRound(q, -q - r, r); const ar=cubeToAxial(cr.x, cr.y, cr.z); return { q: ar.q, r: ar.r }; }
   function axialToOffset(q,r){ const col = q + ((r - (r & 1)) >> 1); const row = r; return { col, row };
   }
-  return { canvas, W, H, renderBackground, drawCarrier, drawSquadron, tileFromEvent, drawLine, getTileFn };
+  return { canvas, W, H, renderBackground, renderVisibilityOverlay, drawCarrier, drawSquadron, drawDiamond, tileFromEvent, drawLine, getTileFn };
 }
 
 function bindUI() {
@@ -766,13 +860,13 @@ function renderEnemyIntel() {
     drawRectTileStyled(ic.x, ic.y, getCss('--enemy'), { memory: true });
   }
 
-  // 敵編隊（ひし形）
+  // 敵編隊（ひし形・赤）
   for (const es of state.enemy.squadrons) {
     const m = state.intel.squadrons.get(es.id);
     if (isVisibleToPlayer(es.x, es.y)) {
-      drawDiamondTile(es.x, es.y, getCss('--enemy-squad'));
+      drawDiamondTile(es.x, es.y, getCss('--enemy'));
     } else if (m && m.ttl > 0) {
-      drawDiamondTileStyled(m.x, m.y, getCss('--enemy-squad'), { memory: true });
+      drawDiamondTileStyled(m.x, m.y, getCss('--enemy'), { memory: true });
     }
   }
 }

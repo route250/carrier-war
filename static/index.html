@@ -83,9 +83,9 @@
           <canvas id="mapCanvas" width="373" height="373" aria-label="戦場マップ"></canvas>
           <div id="legend" class="legend">
             <div><span class="chip chip-carrier"></span>空母</div>
-            <div><span class="chip chip-squad"></span>航空機</div>
+            <div><span class="chip chip-circle" style="background: var(--squad); border: 1px solid #9b7f2e"></span>航空機</div>
             <div><span class="chip" style="background: var(--enemy); border: 1px solid #7a2c2c"></span>敵空母（発見時）</div>
-            <div><span class="chip" style="background: var(--enemy-squad); border: 1px solid #7a522c"></span>敵編隊（発見時）</div>
+            <div><span class="chip chip-diamond" style="background: var(--enemy); border: 1px solid #7a2c2c"></span>敵編隊（発見時）</div>
           </div>
         </section>
         <aside class="sidebar">
@@ -115,7 +115,7 @@
         </div>
       </header>
       <main class="match-room">
-          <div class="room-actions">
+        <div class="room-actions">
           <button id="btnSubmitReady">Done</button>
           <span class="divider"></span>
           <button class="mode-btn active" id="btnMatchModeMove" data-match-mode="move">空母</button>
@@ -128,9 +128,10 @@
             <canvas id="matchCanvas" width="540" height="540" aria-label="PvPマップ"></canvas>
             <div class="legend">
               <div><span class="chip chip-carrier"></span>空母</div>
-              <div><span class="chip" style="background: var(--enemy); border: 1px solid #7a2c2c"></span>相手の空母</div>
+              <div><span class="chip chip-circle" style="background: var(--squad); border: 1px solid #9b7f2e"></span>航空部隊</div>
+              <div><span class="chip" style="background: var(--enemy); border: 1px solid #7a2c2c"></span>敵空母</div>
+              <div><span class="chip chip-diamond" style="background: var(--enemy); border: 1px solid #7a2c2c"></span>敵航空部隊</div>
             </div>
-            <p class="muted">キャンバスをクリックで目的地を指定（移動モード時）。</p>
           </div>
           <aside class="match-sidebar">
             <section>
@@ -141,11 +142,11 @@
               <h2>航空部隊</h2>
               <div id="matchSquadronList" class="panel"></div>
             </section>
-            <section>
-              <h2>ログ</h2>
-              <div id="matchLog" class="log"></div>
-            </section>
           </aside>
+        </section>
+        <section>
+          <h2>ログ</h2>
+          <div id="matchLog" class="log"></div>
         </section>
       </main>
     </div>

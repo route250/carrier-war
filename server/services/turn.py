@@ -83,6 +83,20 @@ class UnitHolder:
             })
             return result
 
+    def to_turn_visible(self, side: str | None) -> set[Position]:
+        result: set[Position] = set()
+        if side is None or side == self.side:
+            # ユニットが索敵した範囲のPosition集合を返す
+            if self.unit.is_active() and self.path:
+                r = self.unit.vision
+                for p in self.path:
+                    # pからr以内の位置を追加
+                    for dx in range(-r, r+1):
+                        for dy in range(-r, r+1):
+                            pos = Position(x=p.x+dx, y=p.y+dy)
+                            if p.hex_distance(pos) <= r:
+                                result.add(pos)
+        return result
 
 def next_step( hexmap:HexArray, units: list[UnitHolder], current: Position, target: Position, *, ignore_land:bool = False) -> Position|None:
     for pos in hexmap.neighbors_by_gradient(current, target, ignore_land=ignore_land):
@@ -170,6 +184,8 @@ class GameBord:
         my_squadrons = []
         other_carrier = None
         other_squadrons = []
+        my_turn_visible: set[Position] = set()
+        other_turn_visible: set[Position] = set()
         for u in self.units_list:
             pd = u.to_payload(view_side)
             if pd is not None:
@@ -183,16 +199,32 @@ class GameBord:
                         my_squadrons.append(pd)
                     else:
                         other_squadrons.append(pd)
+            tv = u.to_turn_visible(view_side)
+            if side == u.side:
+                for pos in tv:
+                    if 0 <= pos.x < self.hexmap.W and 0 <= pos.y < self.hexmap.H:
+                        my_turn_visible.add(pos)
+            else:
+                for pos in tv:
+                    if 0 <= pos.x < self.hexmap.W and 0 <= pos.y < self.hexmap.H:
+                        other_turn_visible.add(pos)
+
         my_result = {}
         if my_carrier is not None:
             my_result['carrier'] = my_carrier
         if my_squadrons:
             my_result['squadrons'] = my_squadrons
+        if my_turn_visible:
+            vlist = sorted(list(my_turn_visible))
+            my_result['turn_visible'] = [ f"{p.x},{p.y}" for p in vlist ]
         other_result = {}
         if other_carrier is not None:
             other_result['carrier'] = other_carrier
         if other_squadrons:
             other_result['squadrons'] = other_squadrons
+        if other_turn_visible:
+            vlist = sorted(list(other_turn_visible))
+            other_result['turn_visible'] = [ f"{p.x},{p.y}" for p in vlist ]
         return my_result, other_result
 
     def _get_carrier_by_side(self, side: str) -> UnitHolder|None:

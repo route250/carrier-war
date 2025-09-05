@@ -112,6 +112,8 @@ button.active { outline: 2px solid var(--accent); }
   display: flex; gap: 8px; flex-wrap: wrap;
 }
 .chip { display: inline-block; width: 12px; height: 12px; border-radius: 2px; margin-right: 6px; vertical-align: -2px; }
+.chip-circle { border-radius: 50%; }
+.chip-diamond { transform: rotate(45deg); border-radius: 2px; display: inline-block; }
 .chip-water { background: var(--water); border: 1px solid #193245; }
 .chip-island { background: var(--island); border: 1px solid #2c4230; }
 .chip-carrier { background: var(--carrier); border: 1px solid #2f5e88; }
@@ -124,7 +126,7 @@ button.active { outline: 2px solid var(--accent); }
   padding: 6px;
   min-height: 260px;
 }
-.sidebar h2, .match-sidebar h2 { font-size: 11px; margin: 4px 0 6px; color: var(--muted); font-weight: 600; }
+.match-room h2 { font-size: 11px; margin: 4px 0 6px; color: var(--muted); font-weight: 600; }
 .panel { background: #14181d; border: 1px solid #1f2831; border-radius: 6px; padding: 4px; min-height: 48px; }
 .kv { display: grid; grid-template-columns: 64px 1fr; gap: 3px 6px; margin-bottom: 4px; }
 .mono { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; }
