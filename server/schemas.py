@@ -53,7 +53,7 @@ class Position(BaseModel,frozen=True):
 
     def is_valid(self) -> bool:
         return self.x>=0 and self.y>=0
-    
+
     @staticmethod
     def new(p1:'int|tuple[int,int]|Position', p2:int|None=None) -> 'Position':
         if isinstance(p1, Position):

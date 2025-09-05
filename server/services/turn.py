@@ -41,6 +41,49 @@ class UnitHolder:
         self.path = [self.unit.pos] if self.unit.is_active() else []
         self.intel = {}
 
+    def to_payload(self, side:str|None) -> dict|None:
+        if side is None or side == self.side:
+            result = {
+                'id': self.unit.id,
+                'hp': self.unit.hp,
+                'max_hp': self.unit.max_hp,
+            }
+            if isinstance(self.unit, SquadronState):
+                result.update({
+                    'state': self.unit.state,
+                })
+            result.update({
+                'x': self.unit.pos.x if self.unit.is_active() else None,
+                'y': self.unit.pos.y if self.unit.is_active() else None,})
+            if self.unit.is_active():
+                if self.path:
+                    result.update({
+                        'x0': self.path[0].x,
+                        'y0': self.path[0].y,
+                    })
+                if self.unit.target:
+                    result.update({
+                        'target': {'x': self.unit.target.x, 'y': self.unit.target.y}
+                    })
+            return result
+        elif self.intel:
+            poist_list = [p for t,p in sorted(self.intel.items())]
+            first_seen = poist_list[0]
+            last_seen = poist_list[-1]
+            result = {
+                'id': self.unit.id,
+                'hp': self.unit.hp,
+                'max_hp': self.unit.max_hp,
+                'x': last_seen.x,
+                'y': last_seen.y,
+            }
+            result.update({
+                'x0': first_seen.x,
+                'y0': first_seen.y,
+            })
+            return result
+
+
 def next_step( hexmap:HexArray, units: list[UnitHolder], current: Position, target: Position, *, ignore_land:bool = False) -> Position|None:
     for pos in hexmap.neighbors_by_gradient(current, target, ignore_land=ignore_land):
         if all( not ou.unit.is_active() or pos != ou.unit.pos for ou in units):
@@ -121,6 +164,43 @@ class GameBord:
     def get_map_array(self) -> list[list[int]]:
         return self.hexmap.copy_as_list()
 
+    def to_payload(self, view_side:str|None=None) -> tuple[dict,dict]:
+        side = view_side if view_side in ['A','B'] else 'A'
+        my_carrier = None
+        my_squadrons = []
+        other_carrier = None
+        other_squadrons = []
+        for u in self.units_list:
+            pd = u.to_payload(view_side)
+            if pd is not None:
+                if isinstance(u.unit, CarrierState):
+                    if side == u.side:
+                        my_carrier = pd
+                    else:
+                        other_carrier = pd
+                elif isinstance(u.unit, SquadronState):
+                    if side == u.side:
+                        my_squadrons.append(pd)
+                    else:
+                        other_squadrons.append(pd)
+        my_result = {}
+        if my_carrier is not None:
+            my_result['carrier'] = my_carrier
+        if my_squadrons:
+            my_result['squadrons'] = my_squadrons
+        other_result = {}
+        if other_carrier is not None:
+            other_result['carrier'] = other_carrier
+        if other_squadrons:
+            other_result['squadrons'] = other_squadrons
+        return my_result, other_result
+
+    def _get_carrier_by_side(self, side: str) -> UnitHolder|None:
+        for u in self.units_list:
+            if u.side == side and isinstance(u.unit, CarrierState):
+                return u
+        return None
+
     def get_carrier_by_side(self, side: str) -> CarrierState|None:
         for u in self.units_list:
             if u.side == side and isinstance(u.unit, CarrierState):
@@ -129,6 +209,9 @@ class GameBord:
 
     def get_squadrons_by_side(self, side: str) -> list[SquadronState]:
         return [u.unit for u in self.units_list if u.side == side and isinstance(u.unit, SquadronState)]
+
+    def get_intel_by_side(self, side: str) -> IntelReport:
+        return self.intel.get(side, IntelReport(side=side, turn=0))
 
     def turn_forward(self, orders:list[PlayerOrders]) -> dict[str,IntelReport]:
         logs:dict[str,list[str]] = {}

@@ -301,8 +301,7 @@ async function updateMatchState() {
     const res = await fetch(`/v1/match/${APP.match.id}/state?token=${encodeURIComponent(APP.match.token)}`);
     if (!res.ok) throw new Error(`status ${res.status}`);
     const st = await res.json();
-  // panels and topbar will be updated by updateMatchPanels()
-    if (st) { APP.matchState = st; renderMatchView(); updateMatchPanels(); updateMatchControls(); }
+    if (st) { handleMatchStateUpdate(st); }
   } catch (e) {
     if (el.matchInfo) el.matchInfo.textContent = '状態取得に失敗しました';
   }
@@ -343,8 +342,7 @@ function startMatchSSE() {
           if (el.matchStatusLbl) el.matchStatusLbl.textContent = payload.status;
           if (el.matchTurnLbl) el.matchTurnLbl.textContent = payload.turn;
           if (el.matchWaitingLbl) el.matchWaitingLbl.textContent = payload.waiting_for;
-          APP.matchState = payload; renderMatchView();
-          updateMatchPanels(); updateMatchControls();
+          handleMatchStateUpdate(payload);
         }
       } catch {}
     };
@@ -354,7 +352,7 @@ function startMatchSSE() {
         if (el.matchStatusLbl) el.matchStatusLbl.textContent = js.status;
         if (el.matchTurnLbl) el.matchTurnLbl.textContent = js.turn;
         if (el.matchWaitingLbl) el.matchWaitingLbl.textContent = js.waiting_for;
-        APP.matchState = js; renderMatchView(); updateMatchPanels(); updateMatchControls();
+        handleMatchStateUpdate(js);
       } catch {}
     });
     es.onerror = () => {
@@ -398,8 +396,15 @@ function renderMatchView() {
   // pending move preview line
   const mine = (mySide === 'A') ? a : b;
   const pending = APP.matchPending?.carrier_target;
-  if (pending && mine && mine.x!=null && mine.y!=null) {
-    APP.matchHex.drawLine(mine.x, mine.y, pending.x, pending.y, 'rgba(106,212,255,0.5)');
+  const srvTarget = mine && mine.target;
+  if (mine && mine.x!=null && mine.y!=null) {
+    if (pending && pending.x!=null && pending.y!=null) {
+      // クライアント側の保留オーダーがあればそれを優先表示
+      APP.matchHex.drawLine(mine.x, mine.y, pending.x, pending.y, 'rgba(106,212,255,0.5)');
+    } else if (srvTarget && srvTarget.x!=null && srvTarget.y!=null) {
+      // 保留が無ければサーバ提供のtargetで進路表示
+      APP.matchHex.drawLine(mine.x, mine.y, srvTarget.x, srvTarget.y, 'rgba(106,212,255,0.35)');
+    }
   }
   // draw my squadrons (own side only)
   const mySqs = (mySide === 'A') ? (st.a && st.a.squadrons) : (st.b && st.b.squadrons);
@@ -408,6 +413,10 @@ function renderMatchView() {
       if (!s || s.state === 'base' || s.state === 'lost') continue;
       if (s.x == null || s.y == null) continue;
       APP.matchHex.drawSquadron(s.x, s.y, getCss('--squad')||'#f2c14e', s.hp||40, 40);
+      // 航空機: 保留オーダー（発艦）よりもサーバtargetを表示（保留はキャリア→目標で別線を描画）
+      if (s.target && s.target.x!=null && s.target.y!=null) {
+        APP.matchHex.drawLine(s.x, s.y, s.target.x, s.target.y, 'rgba(242,193,78,0.4)');
+      }
     }
   }
   // pending launch preview line (from carrier to target)
@@ -423,9 +432,10 @@ function updateMatchControls() {
   const status = s.status;
   const wait = s.waiting_for;
   const disableAll = !APP.match || !s || status !== 'active';
-  // enable editing and submit while active; server gates resolution when both submitted
-  const canSubmit = !disableAll;
-  const canEdit = !disableAll;
+  // enable editing and submit only on your turn
+  // Submitは自分のターン（waiting_for==='you'）の時のみ有効
+  const canSubmit = !disableAll && (wait === 'you');
+  const canEdit = !disableAll && (wait === 'you');
   if (el.btnMatchModeMove) el.btnMatchModeMove.disabled = disableAll || !canEdit;
   if (el.btnMatchModeLaunch) el.btnMatchModeLaunch.disabled = disableAll || !canEdit;
   if (el.btnSubmitReady) el.btnSubmitReady.disabled = disableAll || !canSubmit;
@@ -437,7 +447,7 @@ function onMatchCanvasClick(ev) {
   // respect editability
   const s = APP.matchState || {};
   const status = s.status;
-  const canEdit = (status === 'active');
+  const canEdit = (status === 'active') && (s.waiting_for === 'you');
   const t = APP.matchHex.tileFromEvent(ev);
   if (!t) return;
   if (MATCH_MODE === 'move') {
@@ -470,6 +480,22 @@ function setMatchMode(m) {
   if (el.btnMatchModeMove) el.btnMatchModeMove.classList.toggle('active', m === 'move');
   if (el.btnMatchModeLaunch) el.btnMatchModeLaunch.classList.toggle('active', m === 'launch');
   if (el.matchHint) el.matchHint.textContent = (m === 'move') ? '目的地をクリック（毎ターン自動移動）' : '目標地点をクリック（航続距離は未実装）';
+}
+
+// 共通: マッチ状態の更新時にターン進行を検知して保留オーダーをクリア
+function handleMatchStateUpdate(nextState) {
+  try {
+    const prevTurn = (APP.matchState && typeof APP.matchState.turn === 'number') ? APP.matchState.turn : null;
+    const nextTurn = (nextState && typeof nextState.turn === 'number') ? nextState.turn : null;
+    if (prevTurn != null && nextTurn != null && nextTurn > prevTurn) {
+      // ターンが進んだので保留中のオーダーをクリア
+      APP.matchPending = { carrier_target: null, launch_target: null };
+    }
+  } catch {}
+  APP.matchState = nextState;
+  renderMatchView();
+  updateMatchPanels();
+  updateMatchControls();
 }
 
 function updateMatchPanels() {

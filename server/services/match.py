@@ -28,9 +28,7 @@ from server.schemas import (
     Position,
     PlayerOrders,
     SideIntel,
-    IntelMarker,
 )
-from types import SimpleNamespace
 from server.services.session import (
     _find_path_hex,
     _gradient_full_path,
@@ -73,7 +71,7 @@ class Match:
     subscribers: list[asyncio.Queue[str]] = field(default_factory=list, repr=False)
     subscribers_map: dict[asyncio.Queue[str], Optional[str]] = field(default_factory=dict, repr=False)
     last_report: Optional[dict[str, IntelReport]] = None
-    
+
     def has_open_slot(self) -> bool:
         return not self.side_a.token or not self.side_b.token
 
@@ -94,6 +92,59 @@ class Match:
                 self.status = "over"
         except Exception:
             pass
+
+    def build_state_payload(self, viewer_side: Optional[str] = None) -> dict:
+        waiting_for = "none"
+        if self.status == "active":
+            a_has = self.side_a.orders is not None
+            b_has = self.side_b.orders is not None
+            if not a_has or not b_has:
+                if viewer_side == "A" and not a_has:
+                    waiting_for = "you"
+                elif viewer_side == "B" and not b_has:
+                    waiting_for = "you"
+                else:
+                    waiting_for = "opponent"
+        aw = self.map.W
+        ah = self.map.H
+        my_units, other_units = self.map.to_payload(viewer_side)
+        if viewer_side and viewer_side != 'A':
+            a_units, b_units = other_units, my_units
+        else:
+            a_units, b_units = my_units, other_units
+
+        a_carrier =self.map.get_carrier_by_side("A")
+        b_carrier =self.map.get_carrier_by_side("B")
+
+        result = None
+        if self.status == "over":
+            try:
+                a_hp = a_carrier.hp if a_carrier else 0
+                b_hp = b_carrier.hp if b_carrier else 0
+                if a_hp <= 0 and b_hp <= 0:
+                    result = "draw"
+                elif viewer_side == "A":
+                    result = "lose" if a_hp <= 0 and b_hp > 0 else ("win" if b_hp <= 0 and a_hp > 0 else "draw")
+                elif viewer_side == "B":
+                    result = "lose" if b_hp <= 0 and a_hp > 0 else ("win" if a_hp <= 0 and b_hp > 0 else "draw")
+                else:
+                    result = "draw"
+            except Exception:
+                result = None
+        result_dict = {
+            "type": "state",
+            "match_id": self.match_id,
+            "status": self.status,
+            "turn": self.map.turn,
+            "waiting_for": waiting_for,
+            "map_w": aw,
+            "map_h": ah,
+            "a": a_units,
+            "b": b_units,
+        }
+        if result:
+            result_dict["result"] = result
+        return result_dict
 
 class MatchStore:
     def __init__(self) -> None:
@@ -182,12 +233,17 @@ class MatchStore:
                 self._broadcast_lobby_list()
             except Exception:
                 pass
+            # broadcast updated match state so creator gets immediately notified
+            try:
+                self._broadcast_state(m)
+            except Exception:
+                pass
             return MatchJoinResponse(match_id=m.match_id, player_token=token, side=side, status=m.status)
 
     def state(self, match_id: str, token: Optional[str]) -> MatchStateResponse:
         m = self._matches[match_id]
         side = m.side_for_token(token) if token else None
-        payload = self._build_state_payload(m, viewer_side=side)
+        payload = m.build_state_payload(viewer_side=side)
         return MatchStateResponse(
             match_id=m.match_id,
             status=payload.get("status", m.status),
@@ -204,7 +260,7 @@ class MatchStore:
     def snapshot(self, match_id: str, token: Optional[str] = None) -> dict:
         m = self._matches[match_id]
         side = m.side_for_token(token) if token else None
-        payload = self._build_state_payload(m, viewer_side=side)
+        payload = m.build_state_payload(viewer_side=side)
         payload["map"] = m.map.get_map_array()
         return payload
 
@@ -336,80 +392,11 @@ class MatchStore:
             try:
                 token = m.subscribers_map.get(q)
                 side = m.side_for_token(token) if token else None
-                payload = self._build_state_payload(m, viewer_side=side)
+                payload = m.build_state_payload(viewer_side=side)
                 data = json.dumps(payload, ensure_ascii=False)
                 q.put_nowait(data)
             except Exception:
                 pass
-
-    def _build_state_payload(self, m: Match, *, viewer_side: Optional[str] = None) -> dict:
-        waiting_for = "none"
-        if m.status == "active":
-            a_has = m.side_a.orders is not None
-            b_has = m.side_b.orders is not None
-            if not a_has or not b_has:
-                if viewer_side == "A" and not a_has:
-                    waiting_for = "you"
-                elif viewer_side == "B" and not b_has:
-                    waiting_for = "you"
-                else:
-                    waiting_for = "opponent"
-        aw = m.map.W
-        ah = m.map.H
-        a_carrier =m.map.get_carrier_by_side("A")
-        b_carrier =m.map.get_carrier_by_side("B")
-        # Full carrier info (for self and opponent if visible)
-        a_car_full = {"x": (a_carrier.pos.x if a_carrier else None), "y": (a_carrier.pos.y if a_carrier else None), "hp": (a_carrier.hp if a_carrier else None)}
-        b_car_full = {"x": (b_carrier.pos.x if b_carrier else None), "y": (b_carrier.pos.y if b_carrier else None), "hp": (b_carrier.hp if b_carrier else None)}
-        # Gate opponent info based on intel (3ターン以内の目標捕捉のみ表示)
-        SHOW_TURNS = 3
-        a_car = dict(a_car_full)
-        b_car = dict(b_car_full)
-        if viewer_side == 'A':
-            mark = m.intel_a.carrier
-            if not (mark and isinstance(mark.ttl, int) and mark.ttl > 0 and mark.ttl <= SHOW_TURNS):
-                # hide opponent carrier
-                b_car = {"x": None, "y": None, "hp": None}
-        elif viewer_side == 'B':
-            mark = m.intel_b.carrier
-            if not (mark and isinstance(mark.ttl, int) and mark.ttl > 0 and mark.ttl <= SHOW_TURNS):
-                a_car = {"x": None, "y": None, "hp": None}
-        else:
-            # viewer unknown, hide both opponents
-            a_car = {"x": None, "y": None, "hp": None}
-            b_car = {"x": None, "y": None, "hp": None}
-        a_sq_list = m.map.get_squadrons_by_side("A")
-        b_sq_list = m.map.get_squadrons_by_side("B")
-        a_sq = _squad_light_list(a_sq_list) if (viewer_side == 'A') else None
-        b_sq = _squad_light_list(b_sq_list) if (viewer_side == 'B') else None
-        # per-viewer result when over
-        result = None
-        if m.status == "over":
-            try:
-                a_hp = a_carrier.hp if a_carrier else 0
-                b_hp = b_carrier.hp if b_carrier else 0
-                if a_hp <= 0 and b_hp <= 0:
-                    result = "draw"
-                elif viewer_side == "A":
-                    result = "lose" if a_hp <= 0 and b_hp > 0 else ("win" if b_hp <= 0 and a_hp > 0 else "draw")
-                elif viewer_side == "B":
-                    result = "lose" if b_hp <= 0 and a_hp > 0 else ("win" if a_hp <= 0 and b_hp > 0 else "draw")
-                else:
-                    result = "draw"
-            except Exception:
-                result = None
-        return {
-            "type": "state",
-            "match_id": m.match_id,
-            "status": m.status,
-            "turn": m.map.turn,
-            "waiting_for": waiting_for,
-            **({"result": result} if result is not None else {}),
-            "map_w": aw,
-            "map_h": ah,
-            "a": {k: v for k, v in {"carrier": a_car, "squadrons": a_sq}.items() if v is not None},
-            "b": {k: v for k, v in {"carrier": b_car, "squadrons": b_sq}.items() if v is not None},
-        }
 
     def submit_orders(self, match_id: str, req: MatchOrdersRequest) -> MatchOrdersResponse:
         m = self._matches[match_id]
@@ -456,19 +443,3 @@ def _new_player_state(side:str, cx: int, cy: int) -> list[UnitState]:
     for s in range(0, carrier.hangar):
         un.append(SquadronState(id=f"{side}SQ{s+1}", side=side))
     return un
-
-
-def _squad_light_list(ps: Optional[list[SquadronState]]) -> Optional[list[dict]]:
-    if ps is None:
-        return None
-    out: list[dict] = []
-    for s in ps:
-        item = {
-            "id": s.id,
-            "hp": s.hp,
-            "state": s.state,
-            "x": (s.pos.x if s.is_active() else None),
-            "y": (s.pos.y if s.is_active() else None),
-        }
-        out.append(item)
-    return out
