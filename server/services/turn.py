@@ -378,7 +378,14 @@ class GameBord:
                     u.unit.state = 'engaging'
                     _dbg(self.log_id, f"[Turn {self.turn}] {u.unit.id} starts attacking {ec.unit.id}")
                     match_write(self.log_id, {"type": "engage", "turn": self.turn, "attacker": u.unit.id, "defender": ec.unit.id})
-
+                elif u.unit.pos == u.unit.target:
+                    # 目標に到達したら帰還状態に変更
+                    cu = next((cu for cu in self.units_list if cu.side == u.side and isinstance(cu.unit, CarrierState)), None)
+                    if cu is not None:
+                        u.unit.target = cu.unit.pos
+                    logs.setdefault(u.side, []).append(f"{u.unit.id}({u.unit.pos.x},{u.unit.pos.y}) reached its target and is returning")
+                    u.unit.state = 'returning'
+                    _dbg(self.log_id, f"[Turn {self.turn}] {u.unit.id} reached target → returning")
         # 発艦処理
         for side, order in zip(["A","B"], orders):
             if order.launch_target is not None:

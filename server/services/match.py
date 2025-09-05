@@ -159,8 +159,8 @@ class MatchStore:
         map = HexArray(W, H)
         hex_generate_connected_map(map, blobs=10)
         # Place carriers and ensure sea around them
-        a_units = _new_player_state("A", 3,3 )
-        b_units = _new_player_state("B", W-4, H-4 )
+        a_units = create_units("A", 3,3 )
+        b_units = create_units("B", W-4, H-4 )
         bord = GameBord(map, [a_units, b_units], log_id=mid)
         m = Match(match_id=mid, mode=req.mode or "pvp", map=bord, config=(req.config.dict() if req.config else None))
         # creator occupies side A by default
@@ -435,7 +435,7 @@ class MatchStore:
 store = MatchStore()
 
 # ---------- Internal helpers ----------
-def _new_player_state(side:str, cx: int, cy: int) -> list[UnitState]:
+def create_units(side:str, cx: int, cy: int) -> list[UnitState]:
     un:list[UnitState]=[]
     i=1
     carrier = CarrierState(id=f"{side}C{i}", side=side, pos=Position(x=cx, y=cy))
