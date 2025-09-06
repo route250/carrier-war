@@ -32,7 +32,7 @@ from server.schemas import (
     PlayerOrders,
 )
 
-from server.services.ai_thread import AIThreadABC
+from server.services.ai_base import AIThreadABC
 from server.services.ai_cpu import CarrierBotMedium
 from server.services.turn import GameBord
 

@@ -28,32 +28,7 @@
         </div>
       </header>
       <main class="lobby">
-        <div class="tabs">
-          <button class="tab active" data-lobby="pve">対AI</button>
-          <button class="tab" data-lobby="pvp">対人</button>
-        </div>
-
-        <section id="lobby-pve">
-          <div class="list">
-            <div class="opponent-card selected" data-opponent="AI" data-difficulty="easy">
-              <div class="name">AI (Easy)</div>
-              <div class="desc">初心者向け。控えめな行動。</div>
-            </div>
-            <div class="opponent-card" data-opponent="AI" data-difficulty="normal">
-              <div class="name">AI (Normal)</div>
-              <div class="desc">標準の難易度。</div>
-            </div>
-            <div class="opponent-card" data-opponent="AI" data-difficulty="hard">
-              <div class="name">AI (Hard)</div>
-              <div class="desc">上級者向け。積極的に攻めます。</div>
-            </div>
-          </div>
-          <div class="actions">
-            <button id="startGameBtn">ゲーム開始</button>
-          </div>
-        </section>
-
-        <section id="lobby-pvp" class="hidden">
+        <section id="lobby-pvp">
             <div class="pvp-actions">
             <button id="btnCreateMatch">マッチ作成</button>
             <span class="divider"></span>
@@ -64,49 +39,6 @@
           <div id="matchList" class="match-list empty">読み込み中...</div>
         </section>
       </main>
-    </div>
-
-    <!-- Game View -->
-    <div id="view-game" class="view hidden">
-      <header class="topbar">
-        <div class="title">Carrier war</div>
-        <div class="controls">
-          <button id="btnNextTurn">次のターン</button>
-          <span class="divider"></span>
-          <!-- 選択モードボタンは不要のため削除 -->
-          <button id="btnModeMove" data-mode="move">空母を移動</button>
-          <button id="btnModeLaunch" data-mode="launch">打撃隊を出撃</button>
-          <span class="divider"></span>
-          <button id="btnRestart">リスタート</button>
-          <button id="btnNewMap">新しい海域</button>
-          <span id="hint" class="hint"></span>
-        </div>
-      </header>
-      <main class="layout">
-        <section class="map-wrap">
-          <canvas id="mapCanvas" width="373" height="373" aria-label="戦場マップ"></canvas>
-          <div id="legend" class="legend">
-            <div><span class="chip chip-carrier"></span>空母</div>
-            <div><span class="chip chip-circle" style="background: var(--squad); border: 1px solid #9b7f2e"></span>航空機</div>
-            <div><span class="chip" style="background: var(--enemy); border: 1px solid #7a2c2c"></span>敵空母（発見時）</div>
-            <div><span class="chip chip-diamond" style="background: var(--enemy); border: 1px solid #7a2c2c"></span>敵編隊（発見時）</div>
-          </div>
-        </section>
-        <aside class="sidebar">
-          <section>
-            <h2>空母</h2>
-            <div id="carrierStatus" class="panel"></div>
-          </section>
-          <section>
-            <h2>航空機編隊</h2>
-            <div id="squadronList" class="panel"></div>
-          </section>
-        </aside>
-      </main>
-      <section class="log-wrap">
-        <h2>ログ</h2>
-        <div id="log" class="log"></div>
-      </section>
     </div>
 
     <!-- Match Room View (PvP) -->

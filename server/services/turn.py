@@ -1,5 +1,5 @@
 
-from server.schemas import SessionStepRequest, PlayerOrders
+from server.schemas import PlayerOrders
 from server.schemas import Position, UnitState, CarrierState, SquadronState, IntelPath, IntelReport
 from server.schemas import SQUAD_MAX_HP, CARRIER_MAX_HP
 from server.services.hexmap import HexArray

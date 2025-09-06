@@ -14,8 +14,7 @@ const SQUADRON_RANGE = 22;    // 航空機の航続距離（空母からの最�
 // === State ===
 const SQUAD_MAX_HP = 40;
 const CARRIER_MAX_HP = 100;
-const APP = { view: 'entrance', username: '', opponent: 'AI', difficulty: 'easy', lobbyMode: 'pve', match: null, matchSSE: null, matchHex: null, matchPending: { carrier_target: null, launch_target: null }, matchLoggedUpToTurn: 0, matchHover: null, gameHex: null };
-let GAME_INITIALIZED = false;
+const APP = { view: 'entrance', username: '', match: null, matchSSE: null, matchHex: null, matchPending: { carrier_target: null, launch_target: null }, matchLoggedUpToTurn: 0, matchHover: null };
 const state = {
   map: [], // 0=sea, 1=island
   turn: 1,
@@ -40,28 +39,17 @@ const state = {
 
 // === DOM ===
 const el = {
-  canvas: document.getElementById('mapCanvas'),
-  hint: document.getElementById('hint'),
-  carrierStatus: document.getElementById('carrierStatus'),
-  squadronList: document.getElementById('squadronList'),
-  log: document.getElementById('log'),
-  btnNextTurn: document.getElementById('btnNextTurn'),
-  btnModeMove: document.getElementById('btnModeMove'),
-  btnModeLaunch: document.getElementById('btnModeLaunch'),
-  btnRestart: document.getElementById('btnRestart'),
-  btnNewMap: document.getElementById('btnNewMap'),
+  // PvE用DOMは削除
   // Entrance/Lobby
   viewEntrance: document.getElementById('view-entrance'),
   viewLobby: document.getElementById('view-lobby'),
-  viewGame: document.getElementById('view-game'),
+  // view-game は廃止
   viewMatch: document.getElementById('view-match'),
   usernameInput: document.getElementById('usernameInput'),
   enterLobby: document.getElementById('enterLobby'),
   lobbyUser: document.getElementById('lobbyUser'),
   startGameBtn: document.getElementById('startGameBtn'),
   // PvP lobby
-  tabButtons: Array.from(document.querySelectorAll('.tab[data-lobby]')),
-  lobbyPve: document.getElementById('lobby-pve'),
   lobbyPvp: document.getElementById('lobby-pvp'),
   btnCreateMatch: document.getElementById('btnCreateMatch'),
   matchList: document.getElementById('matchList'),
@@ -78,14 +66,14 @@ const el = {
   btnMatchModeLaunch: document.getElementById('btnMatchModeLaunch'),
 };
 
-const ctx = el.canvas.getContext('2d');
+// PvEキャンバスは廃止
 
 // === App Init / Navigation ===
 function showView(name) {
   APP.view = name;
   el.viewEntrance?.classList.toggle('hidden', name !== 'entrance');
   el.viewLobby?.classList.toggle('hidden', name !== 'lobby');
-  el.viewGame?.classList.toggle('hidden', name !== 'game');
+  // el.viewGame は廃止
   el.viewMatch?.classList.toggle('hidden', name !== 'match');
   if (name === 'lobby') {
     try { startLobbySSE(); } catch {}
@@ -114,31 +102,8 @@ function initApp() {
     if (e.key === 'Enter') el.enterLobby?.click();
   });
 
-  // Lobby interactions (only AI for now)
-  document.querySelectorAll('.opponent-card').forEach((card) => {
-    card.addEventListener('click', () => {
-      document.querySelectorAll('.opponent-card').forEach(c => c.classList.remove('selected'));
-      card.classList.add('selected');
-      APP.opponent = card.getAttribute('data-opponent') || 'AI';
-      APP.difficulty = card.getAttribute('data-difficulty') || 'normal';
-    });
-  });
-  el.startGameBtn?.addEventListener('click', () => {
-    // Future: send opponent/username to server if needed
-    startGameFlow();
-  });
-
-  // Lobby tab switching
-  el.tabButtons.forEach(btn => btn.addEventListener('click', () => {
-    el.tabButtons.forEach(b => b.classList.remove('active'));
-    btn.classList.add('active');
-    APP.lobbyMode = btn.getAttribute('data-lobby') || 'pve';
-    const pve = APP.lobbyMode === 'pve';
-    el.lobbyPve?.classList.toggle('hidden', !pve);
-    el.lobbyPvp?.classList.toggle('hidden', pve);
-    // Keep lobby SSE persistent regardless of tab
-    try { startLobbySSE(); } catch {}
-  }));
+  // PvEロビーUIは廃止（常にPvPロビー）
+  try { startLobbySSE(); } catch {}
 
   // PvP lobby actions
   el.btnCreateMatch?.addEventListener('click', createMatch);
@@ -159,23 +124,7 @@ function initApp() {
   el.btnMatchModeLaunch?.addEventListener('click', () => setMatchMode('launch'));
 }
 
-function startGameFlow() {
-  showView('game');
-  if (!GAME_INITIALIZED) initGame();
-}
-
-// === Game Init ===
-function initGame() {
-  GAME_INITIALIZED = true;
-  bindUI();
-  computeHexMetrics();
-  // サーバセッションを作成（サーバ側でマップ生成）
-  ensureSession()
-    .then((sid)=>{ if (sid) { logMsg(`作戦開始: ターン${state.turn} (session: ${sid})`); renderAll(); } })
-    .catch((e)=>{ logMsg(`セッション初期化エラー: ${e && e.message ? e.message : e}`); });
-  // 作戦開始ログは ensureSession 完了時に出す
-  setHint();
-}
+// 旧PvE（Single）フローは廃止
 
 // === PvP (Match) ===
 async function createMatch() {
@@ -851,112 +800,6 @@ function makeHexRenderer(canvas, W, H, getTileFn) {
   return { canvas, W, H, renderBackground, renderVisibilityOverlay, drawCarrier, drawCarrierStyled, drawSquadron, drawDiamond, drawDiamondStyled, tileFromEvent, drawLine, drawHexOutline, drawRangeOutline, renderHoverOutline, getTileFn };
 }
 
-function bindUI() {
-  el.canvas.addEventListener('mousemove', onMouseMove);
-  el.canvas.addEventListener('mouseleave', () => (state.highlight = null, renderAll()));
-  el.canvas.addEventListener('click', onMapClick);
-
-  el.btnNextTurn.addEventListener('click', () => {
-    nextTurn();
-  });
-
-  const modeButtons = [el.btnModeMove, el.btnModeLaunch].filter(Boolean);
-  modeButtons.forEach((b) => b.addEventListener('click', () => setMode(b.dataset.mode)));
-
-  el.btnRestart.addEventListener('click', () => restartGame('restart'));
-  el.btnNewMap.addEventListener('click', () => restartGame('newmap'));
-}
-
-function setMode(mode) {
-  state.mode = mode;
-  state.highlight = null;
-  document.querySelectorAll('[data-mode]').forEach((b) => b.classList.toggle('active', b.dataset.mode === mode));
-  setHint();
-  renderAll();
-}
-
-function setHint() {
-  const m = state.mode;
-  const text = m === 'move'
-    ? '目的地をクリック（毎ターン自動移動）'
-    : m === 'launch'
-      ? `目標地点をクリック（航続${SQUADRON_RANGE}以内）`
-      : 'ユニット状況を確認できます';
-  el.hint.textContent = text;
-}
-
-// === Rendering ===
-function renderAll() {
-  renderMap();
-  renderUnits();
-  renderEnemyIntel();
-  updatePanels();
-}
-
-function renderMap() {
-  // 共通レンダラに完全移管
-  try {
-    if (!APP.gameHex || APP.gameHex.canvas !== el.canvas || APP.gameHex.W !== MAP_W || APP.gameHex.H !== MAP_H) {
-      APP.gameHex = makeHexRenderer(el.canvas, MAP_W, MAP_H, (x,y)=> state.map?.[y]?.[x] || 0);
-    } else {
-      APP.gameHex.getTileFn = (x,y)=> state.map?.[y]?.[x] || 0;
-    }
-    APP.gameHex.renderBackground();
-    if (state.turnVisible && state.turnVisible.size > 0) {
-      APP.gameHex.renderVisibilityOverlay(state.turnVisible);
-    }
-    APP.gameHex.renderHoverOutline({ mode: state.mode, hover: state.highlight, carrier: state.carrier, squadrons: state.squadrons });
-  } catch {}
-}
-
-function renderUnits() {
-  if (!APP.gameHex) return;
-  // carrier
-  APP.gameHex.drawCarrier(state.carrier.x, state.carrier.y, getCss('--carrier') || '#4aa3ff', state.carrier.hp, CARRIER_MAX_HP);
-  if (state.carrier.target) {
-    APP.gameHex.drawLine(state.carrier.x, state.carrier.y, state.carrier.target.x, state.carrier.target.y, 'rgba(106,212,255,0.35)');
-  }
-
-  // pending launch preview
-  if (typeof PENDING_LAUNCH === 'object' && PENDING_LAUNCH && typeof PENDING_LAUNCH.x === 'number' && typeof PENDING_LAUNCH.y === 'number') {
-    const t = { x: PENDING_LAUNCH.x, y: PENDING_LAUNCH.y };
-    const from = findFreeAdjacent(state.carrier.x, state.carrier.y, { preferAwayFrom: t }) || { x: state.carrier.x, y: state.carrier.y };
-    APP.gameHex.drawLine(from.x, from.y, t.x, t.y, 'rgba(242,193,78,0.5)');
-  }
-
-  // squadrons
-  for (const sq of state.squadrons) {
-    if (sq.state === 'base' || sq.state === 'lost') continue;
-    APP.gameHex.drawSquadron(sq.x, sq.y, getCss('--squad') || '#f2c14e', sq.hp ?? SQUAD_MAX_HP, SQUAD_MAX_HP);
-    if (sq.state === 'outbound' && sq.target && sq.target.x != null && sq.target.y != null) {
-      APP.gameHex.drawLine(sq.x, sq.y, sq.target.x, sq.target.y, 'rgba(242,193,78,0.35)');
-    }
-  }
-}
-
-function renderEnemyIntel() {
-  // 敵空母（現在可視なら現在地、不可視なら記憶を表示）
-  const c = state.enemy.carrier;
-  const ic = state.intel.carrier;
-  if (isVisibleToPlayer(c.x, c.y)) {
-    if (APP.gameHex) APP.gameHex.drawCarrier(c.x, c.y, getCss('--enemy') || '#ff6464', c.hp, CARRIER_MAX_HP);
-  } else if (ic.ttl > 0) {
-    if (APP.gameHex && APP.gameHex.drawCarrierStyled) APP.gameHex.drawCarrierStyled(ic.x, ic.y, getCss('--enemy') || '#ff6464', { memory: true });
-  }
-
-  // 敵編隊（ひし形・赤）
-  for (const es of state.enemy.squadrons) {
-    const m = state.intel.squadrons.get(es.id);
-    if (isVisibleToPlayer(es.x, es.y)) {
-      if (APP.gameHex) APP.gameHex.drawDiamond(es.x, es.y, getCss('--enemy') || '#ff6464');
-    } else if (m && m.ttl > 0) {
-      if (APP.gameHex && APP.gameHex.drawDiamondStyled) APP.gameHex.drawDiamondStyled(m.x, m.y, getCss('--enemy') || '#ff6464', { memory: true });
-    }
-  }
-}
-
-// 旧PvE描画関数は共通Hexレンダラへ統合済み
-
 // === Panels ===
 function updatePanels() {
   const c = state.carrier;
@@ -995,93 +838,7 @@ function countBaseAvailable() { return state.squadrons.filter((s)=>s.state==='ba
 function countActiveEnemySquadrons() { return state.enemy.squadrons.filter((s)=>s.state!=='base' && s.state!=='lost').length; }
 
 // === Interaction ===
-function onMouseMove(e) {
-  const t = (APP.gameHex && APP.gameHex.tileFromEvent) ? APP.gameHex.tileFromEvent(e) : tileFromEvent(e);
-  if (!t) return;
-  state.highlight = t;
-  renderAll();
-}
-
-function onMapClick(e) {
-  if (state.gameOver) return;
-  const t = (APP.gameHex && APP.gameHex.tileFromEvent) ? APP.gameHex.tileFromEvent(e) : tileFromEvent(e);
-  if (!t) return;
-
-  if (state.mode === 'move') {
-    setCarrierDestination(t.x, t.y);
-  } else if (state.mode === 'launch') {
-    tryLaunchStrike(t.x, t.y);
-  }
-}
-
-function setCarrierDestination(x, y) {
-  // 目的地は海に制限。島をクリックしたら最寄りの海に補正。
-  let dest = { x, y };
-  if (state.map[y][x] === 1) {
-    dest = nearestSea(x, y);
-    if (state.map[dest.y][dest.x] === 1) { logMsg('適切な海マスが見つかりません'); return; }
-  }
-  state.carrier.target = dest;
-  if (state.carrier.x === dest.x && state.carrier.y === dest.y) {
-    logMsg('空母は既に目的地に到達しています');
-  } else {
-    logMsg(`空母の目的地を(${dest.x}, ${dest.y})に設定`);
-  }
-  renderAll();
-}
-
-function tryLaunchStrike(tx, ty) {
-    // セッション運用時はサーバへ発艦指示のみ送る（次のターンで処理）
-    if (countBaseAvailable() <= 0) { logMsg('搭載機がありません'); return; }
-    if (hexDistance({ x: tx, y: ty }, state.carrier) > SQUADRON_RANGE) { logMsg(`航続距離外です（最大${SQUADRON_RANGE}）`); return; }
-    PENDING_LAUNCH = { x: tx, y: ty };
-    logMsg(`発艦指示を登録（${tx}, ${ty}） 次のターンで出撃`);
-    renderAll();
-    return;
-}
-
-// === Turn ===
-async function nextTurn() {
-  if (state.gameOver) return;
-  // avoid double-click during async call
-  try { el.btnNextTurn.disabled = true; } catch {}
-
-  // このターンで移動した経路を収集（自軍のみ）
-  const pathSweep = [];// array of {x,y,range}
-
-  // 2) 敵AI：サーバでターン解決（セッション）またはAIプランのみ取得
-  try {
-    const req = buildSessionStepRequest();
-    const plan = await callSessionStep(req);
-    logMsg(`ターン${state.turn}`);
-    enemyTurnFromPlan(plan);
-  } catch (e) {
-    logMsg(`AIプラン取得エラー: ${e && e.message ? e.message : e}`);
-    // サーバーが応答しない場合はここでターン処理を中止する（フォールバックを行わない）
-    logMsg('サーバー未応答のためターン処理を中止します');
-    return;
-  }
-
-  renderAll();
-
-  try { el.btnNextTurn.disabled = false; } catch {}
-}
-
-// === Utils ===
-function tileFromEvent(e) {
-  // Scale client coords to canvas internal coords to handle CSS/devicePixelRatio
-  const rect = el.canvas.getBoundingClientRect();
-  const scaleX = el.canvas.width / rect.width;
-  const scaleY = el.canvas.height / rect.height;
-  const mx = (e.clientX - rect.left) * scaleX;
-  const my = (e.clientY - rect.top) * scaleY;
-  const [qf, rf] = pixelToAxial(mx, my);
-  const { q, r } = axialRound(qf, rf);
-  const off = axialToOffset(q, r);
-  const c = off.col, rr = off.row;
-  if (c < 0 || rr < 0 || c >= MAP_W || rr >= MAP_H) return null;
-  return { x: c, y: rr };
-}
+// === Utils (shared) ===
 
 function hexDistance(a, b) {
   const aa = offsetToAxial(a.x, a.y); const bb = offsetToAxial(b.x, b.y);
@@ -1150,16 +907,6 @@ function isOccupied(x, y, { ignore } = {}) {
     if (s.x === x && s.y === y) return true;
   }
   return false;
-}
-
-// 空母周辺の空きマスを探索（8近傍）。preferAwayFromがあれば遠ざかる方向を優先。
-function findFreeAdjacent(cx, cy, { preferAwayFrom } = {}) {
-  const candidates = offsetNeighbors(cx, cy).filter(p => p.x >= 0 && p.y >= 0 && p.x < MAP_W && p.y < MAP_H && state.map[p.y][p.x] === 0 && !isOccupied(p.x, p.y));
-  if (candidates.length === 0) return null;
-  if (preferAwayFrom) {
-    candidates.sort((a, b) => hexDistance(preferAwayFrom, b) - hexDistance(preferAwayFrom, a));
-  }
-  return candidates[0];
 }
 
 function isVisibleToPlayer(x, y) {
@@ -1248,230 +995,6 @@ function offsetNeighbors(c, r) {
     ? [[+1,0],[+1,-1],[0,-1],[-1,0],[0,+1],[+1,+1]]
     : [[+1,0],[0,-1],[-1,-1],[-1,0],[-1,+1],[0,+1]];
   return deltas.map(([dc, dr]) => ({ x: c + dc, y: r + dr }));
-}
-// === Session (stateful) ===
-let SESSION_ID = null;
-
-async function ensureSession() {
-  if (SESSION_ID) return SESSION_ID;
-  // Do not synthesize initial squadrons on the client; server returns authoritative initial state.
-  // Send minimal player/enemy carrier info. Server will populate squadrons and map.
-  const res = await fetch('/v1/session/', {
-    method: 'POST', headers: { 'Content-Type': 'application/json' },
-    // mapは送らず、サーバ側で生成
-    body: JSON.stringify({
-      config: { difficulty: APP.difficulty || 'normal', time_ms: 50 }
-    })
-  });
-  if (!res.ok) throw new Error(`session create failed: ${res.status}`);
-  const data = await res.json();
-  if( typeof data?.session_id !== 'string') {
-    throw new Error(`invalid session_id: ${JSON.stringify(data?.session_id)}`);
-  }
-  if( typeof data?.turn !== 'number' || data.turn !== 1 ) {
-    throw new Error(`invalid turn: ${JSON.stringify(data?.turn)}`);
-  }
-  if( !Array.isArray(data?.map) ) {
-    throw new Error(`invalid map: ${JSON.stringify(data?.map)}`);
-  }
-  SESSION_ID = data.session_id;
-  state.session_id = data.session_id;
-  state.turn = data.turn;
-  state.map = data.map;
-  // Server returns authoritative carrier state (including x,y and target)
-  state.carrier = { ...state.carrier, ...data.player_state.carrier };
-  state.squadrons = data.player_state.squadrons || [];
-  state.enemy.carrier = { ...state.enemy.carrier, ...data.enemy_state.carrier };
-
-  return SESSION_ID;
-}
-
-function buildSessionStepRequest() {
-  const player_orders = buildPlayerOrders();
-  return {
-    player_orders,
-    config: { difficulty: APP.difficulty || 'normal', time_ms: 50 },
-  };
-}
-
-let PENDING_LAUNCH = null;
-function buildPlayerOrders() {
-  const orders = {};
-  if (state.carrier.target) orders.carrier_target = { x: state.carrier.target.x, y: state.carrier.target.y };
-  if (PENDING_LAUNCH) orders.launch_target = { x: PENDING_LAUNCH.x, y: PENDING_LAUNCH.y };
-  PENDING_LAUNCH = null; // consume
-  return orders;
-}
-
-async function callSessionStep(body) {
-  await ensureSession();
-  const res = await fetch(`/v1/session/${SESSION_ID}/step`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) });
-  if (!res.ok) {
-    const txt = await res.text().catch(()=> '');
-    throw new Error(`status ${res.status} ${txt}`);
-  }
-  const json = await res.json();
-  if( typeof json?.session_id !== 'string' || state.session_id !== json.session_id) {
-    throw new Error(`invalid session_id: ${JSON.stringify(json?.session_id)}`);
-  }
-  if( typeof json?.turn !== 'number' || json.turn <= state.turn ) {
-    throw new Error(`invalid turn: ${JSON.stringify(json?.turn)}`);
-  }
-  state.turn = json.turn;
-  return json;
-}
-
-function enemyTurnFromPlan(plan) {
-    if (!plan || !plan.enemy_state) {
-        logMsg('サーバが権威ある状態を返しませんでした。クライアントはローカル解決を行いません。');
-    }
-
-    const ec = state.enemy.carrier;
-    // apply enemy carrier
-    state.enemy.carrier = { ...state.enemy.carrier, ...plan.enemy_state.carrier };
-    // apply enemy squadrons (server-provided x,y)
-    state.enemy.squadrons = plan.enemy_state.squadrons || [];
-    // apply player carrier and squadrons (authoritative)
-    if (plan.player_state) {
-        // Server is authoritative for carrier target and position
-        state.carrier = { ...state.carrier, ...plan.player_state.carrier };
-        state.squadrons = plan.player_state.squadrons || [];
-    }
-    // memory
-    if (plan.enemy_memory_out && plan.enemy_memory_out.carrier_last_seen) {
-        state.enemyIntel.carrier = { ...plan.enemy_memory_out.carrier_last_seen };
-    }
-    if (plan.enemy_memory_out && plan.enemy_memory_out.enemy_ai) {
-        const ai = plan.enemy_memory_out.enemy_ai;
-        state.enemyAI.patrolIx = ai.patrol_ix | 0;
-        state.enemyAI.lastPatrolTurn = ai.last_patrol_turn | 0;
-    }
-    // player intel from server
-    if (plan.player_intel) {
-        if (plan.player_intel.carrier) {
-        state.intel.carrier = { ...plan.player_intel.carrier };
-        }
-        if (Array.isArray(plan.player_intel.squadrons)) {
-        const mp = new Map();
-        for (const item of plan.player_intel.squadrons) {
-            if (item && item.id && item.marker) {
-            mp.set(item.id, { ...item.marker });
-            }
-        }
-        state.intel.squadrons = mp;
-        }
-    }
-  // server-computed visibility
-  if (!Array.isArray(plan.turn_visible)) {
-    throw new Error('server did not return plan.turn_visible - authoritative turn visibility is required');
-  }
-  // Validate server visibility against local computation for all cells to detect inconsistencies
-  const srvSet = new Set(plan.turn_visible);
-  for (let y = 0; y < MAP_H; y++) {
-    for (let x = 0; x < MAP_W; x++) {
-      const key = visibilityKey(x, y);
-      const srvHas = srvSet.has(key);
-      const localHas = !!localIsVisibleToPlayer(x, y);
-      if (srvHas !== localHas) {
-        //throw new Error(`visibility mismatch at ${key}: server=${srvHas} client=${localHas}`);
-        //logMsg(`visibility mismatch at ${key}: server=${srvHas} client=${localHas}`);
-      }
-    }
-  }
-  state.turnVisible = new Set(plan.turn_visible);
-    // game status
-    if (plan.game_status && plan.game_status.over && !state.gameOver) {
-        const res = plan.game_status.result || 'draw';
-        const msg = plan.game_status.message || (res === 'win' ? '勝利' : res === 'lose' ? '敗北' : '引き分け');
-        finishGame(res, msg);
-    }
-    // logs
-    if (Array.isArray(plan.logs)) for (const m of plan.logs) logMsg(m);
-    return;
-
-}
-
-function nearestSea(x, y) {
-  x = clamp(x, 0, MAP_W - 1); y = clamp(y, 0, MAP_H - 1);
-  if (state.map[y][x] === 0) return { x, y };
-  // 同心円状に最寄り海タイルを探す（半径最大6）
-  for (let r = 1; r <= 6; r++) {
-    for (let dy = -r; dy <= r; dy++) {
-      for (let dx = -r; dx <= r; dx++) {
-        const nx = clamp(x + dx, 0, MAP_W - 1);
-        const ny = clamp(y + dy, 0, MAP_H - 1);
-        if (state.map[ny][nx] === 0) return { x: nx, y: ny };
-      }
-    }
-  }
-  // どうしても見つからなければ元座標
-  return { x, y };
-}
-
-// === Turn Visibility (player) ===
-function visibilityKey(x, y) { return `${x},${y}`; }
-function isTurnVisible(x, y) { return !!state.turnVisible && state.turnVisible.has(visibilityKey(x, y)); }
-function clearTurnVisibility() { state.turnVisible = new Set(); }
-
-function finishGame(result, message) {
-  state.gameOver = true;
-  logMsg(message);
-  disableControls();
-  setTimeout(() => alert(message), 10);
-}
-
-function disableControls() {
-  document.querySelectorAll('button').forEach((b) => b.disabled = true);
-}
-
-function enableControls() {
-  document.querySelectorAll('button').forEach((b) => b.disabled = false);
-}
-
-function clearLog() {
-  state.log = [];
-  el.log.innerHTML = '';
-}
-
-function restartGame(kind) {
-  // reset state fields (keep same objects to avoid re-binding)
-  state.turn = 1;
-  state.mode = 'select';
-  state.carrier = { id: 'C1', x: 3, y: 3, hp: 100, speed: 2, vision: VISION_CARRIER, hangar: 2, target: null };
-  state.enemy = { carrier: { id: 'E1', x: 26, y: 26, hp: 100, speed: 2, vision: VISION_CARRIER, hangar: 2 }, squadrons: [] };
-  state.intel = { carrier: { seen: false, x: null, y: null, ttl: 0 }, squadrons: new Map() };
-  state.enemyIntel = { carrier: { seen: false, x: null, y: null, ttl: 0 } };
-  state.enemyAI = { patrolIx: 0, lastPatrolTurn: 0 };
-  state.squadrons = Array.from({ length: state.carrier.hangar }, (_, i) => ({ id: `SQ${i + 1}`, hp: SQUAD_MAX_HP, state: 'base' }));
-  state.enemy.squadrons = Array.from({ length: state.enemy.carrier.hangar }, (_, i) => ({ id: `ESQ${i + 1}`, hp: SQUAD_MAX_HP, state: 'base' }));
-  state.highlight = null;
-  state.gameOver = false;
-
-  // サーバで新しいマップ・状態を生成
-  
-  // UI
-  enableControls();
-  document.querySelectorAll('[data-mode]').forEach((b) => b.classList.remove('active'));
-  // btnModeSelect removed; set default mode button active via available buttons
-  const firstModeBtn = document.querySelector('.controls button[data-mode]');
-  if (firstModeBtn) firstModeBtn.classList.add('active');
-  setHint();
-  clearLog();
-  logMsg(kind === 'newmap' ? '新しい海域で作戦開始: ターン1' : 'リスタート: ターン1');
-  // Reset session and create a new one for the new map/state
-  SESSION_ID = null;
-  ensureSession().then(()=>{ renderAll(); }).catch(()=>{});
-}
-
-function logMsg(msg) {
-  const ts = new Date().toLocaleTimeString('ja-JP', { hour12: false });
-  state.log.push({ ts, msg });
-  if (state.log.length > 200) state.log.shift();
-  const line = document.createElement('div');
-  line.className = 'entry';
-  line.innerHTML = `<span class="ts">[${ts}]</span>${escapeHtml(msg)}`;
-  el.log.appendChild(line);
-  el.log.scrollTop = el.log.scrollHeight;
 }
 
 function escapeHtml(s) { return s.replace(/[&<>"']/g, (c) => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;','\'':'&#39;'}[c])); }

@@ -1,5 +1,6 @@
 from pathlib import Path
 import sys
+import traceback
 
 from fastapi import FastAPI
 from fastapi.responses import FileResponse
@@ -34,25 +35,12 @@ def read_index():
 def healthz():
     return {"status": "ok"}
 
-
-# API routers
-try:
-    from server.routers.ai_router import router as ai_router
-    app.include_router(ai_router, prefix="/v1/ai", tags=["ai"])
-except Exception as e:
-    print(f"Failed to load AI router: {e}")
-
-try:
-    from server.routers.session_router import router as session_router
-    app.include_router(session_router, prefix="/v1/session", tags=["session"])
-except Exception as e:
-    print(f"Failed to load Session router: {e}")
-
 try:
     from server.routers.match_router import router as match_router
     app.include_router(match_router, prefix="/v1/match", tags=["match"])
 except Exception as e:
     print(f"Failed to load Match router: {e}")
+    traceback.print_exc()
 
 
 if __name__ == "__main__":

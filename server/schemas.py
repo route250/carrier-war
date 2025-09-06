@@ -9,12 +9,16 @@ except Exception:  # fallback for environments without pydantic v2
 
 INF:int = 10**8
 
-SQUAD_MAX_HP = 40
 CARRIER_MAX_HP = 100
-VISION_SQUADRON = 5
-VISION_CARRIER = 4
-SQUADRON_RANGE = 22
+CARRIER_SPEED = 2
+CARRIER_HANGAR = 2
 CARRIER_RANGE = 99999
+VISION_CARRIER = 4
+
+SQUAD_MAX_HP = 40
+SQUAD_SPEED = 4
+SQUADRON_RANGE = 22
+VISION_SQUADRON = 5
 
 class Position(BaseModel,frozen=True):
 
@@ -182,17 +186,17 @@ class UnitState(BaseModel):
 class CarrierState(UnitState):
     hp: int = CARRIER_MAX_HP
     max_hp: int = CARRIER_MAX_HP
-    speed: int = 2
+    speed: int = CARRIER_SPEED
     fuel: int = CARRIER_RANGE
     vision: int = VISION_CARRIER
-    hangar: int = 2
+    hangar: int = CARRIER_HANGAR    
 
 
 class SquadronState(UnitState):
     pos: Position = Position.invalid()
     hp: int = SQUAD_MAX_HP
     max_hp: int = SQUAD_MAX_HP
-    speed: int = 4
+    speed: int = SQUAD_SPEED
     fuel: int = SQUADRON_RANGE
     vision: int = VISION_SQUADRON
     state: Literal["base", "outbound", "engaging", "returning", "lost"] = "base"
@@ -201,82 +205,7 @@ class SquadronState(UnitState):
         return super().is_active() and self.state != "lost" and self.state != 'base'
 
 
-class PlayerState(BaseModel):
-    side:str
-    carrier: CarrierState
-    squadrons: List[SquadronState] = []
-    # Server-authoritative persistent move target for the player's carrier
-    carrier_target: Optional[Position] = Field(default=None, exclude=True)
-    # Cross-turn last positions to avoid immediate backtracking across turns
-    last_pos_squadrons: Dict[str, Position] = Field(default_factory=dict, exclude=True)
-    last_pos_carrier: Optional[Position] = Field(default=None, exclude=True)
 
-    def is_visible_to_player(self, unit:UnitState) -> bool:
-        """Return True if tile (x,y) is visible to the player (carrier or active squadrons).
-        """
-        if self.carrier and self.carrier.is_visible_to_player(unit):
-            return True
-        for sq in self.squadrons:
-            if sq.is_visible_to_player(unit):
-                return True
-        return False
-
-
-class IntelMarker(BaseModel):
-    seen: bool
-    pos: Position
-    ttl: int
-
-    # Flattened coordinates for client convenience (read-only)
-    if computed_field:
-        @computed_field  # type: ignore[misc]
-        def x(self) -> Optional[int]:
-            try:
-                return self.pos.x if (self.pos and self.pos.x >= 0 and self.pos.y >= 0) else None
-            except Exception:
-                return None
-
-        @computed_field  # type: ignore[misc]
-        def y(self) -> Optional[int]:
-            try:
-                return self.pos.y if (self.pos and self.pos.x >= 0 and self.pos.y >= 0) else None
-            except Exception:
-                return None
-
-
-class EnemyAIState(BaseModel):
-    patrol_ix: int = 0
-    last_patrol_turn: int = 0
-
-
-class EnemyMemory(BaseModel):
-    carrier_last_seen: Optional[IntelMarker] = None
-    enemy_ai: Optional[EnemyAIState] = None
-
-
-class SquadronIntel(BaseModel):
-    id: str
-    marker: IntelMarker
-
-
-class PlayerIntel(BaseModel):
-    carrier: Optional[IntelMarker] = None
-    squadrons: List[SquadronIntel] = []
-
-
-class SideIntel(BaseModel):
-    # Symmetric intel container per side (server-internal)
-    carrier: Optional[IntelMarker] = None
-    squadrons: Dict[str, IntelMarker] = Field(default_factory=dict)
-
-
-class SquadronLight(BaseModel):
-    id: str
-    pos: Position
-
-
-class PlayerObservation(BaseModel):
-    visible_squadrons: List[SquadronLight] = []
 
 
 class Config(BaseModel):
@@ -284,93 +213,10 @@ class Config(BaseModel):
     time_ms: Optional[int] = 50
 
 
-class PlanRequest(BaseModel):
-    turn: int
-    map: List[List[int]]
-    enemy_state: PlayerState
-    enemy_memory: Optional[EnemyMemory] = None
-    player_observation: Optional[PlayerObservation] = None
-    config: Optional[Config] = None
-    rand_seed: Optional[int] = None
-
-
-class CarrierOrder(BaseModel):
-    type: Literal["move", "hold"]
-    target: Optional[Position] = None
-
-
-class SquadronOrder(BaseModel):
-    id: str
-    action: Literal["launch", "engage", "return", "hold"]
-    target: Optional[Position] = None
-
-
-class PlanResponse(BaseModel):
-    carrier_order: CarrierOrder
-    squadron_orders: List[SquadronOrder] = []
-    enemy_memory_out: Optional[EnemyMemory] = None
-    logs: List[str] = []
-    metrics: Dict[str, Any] = {}
-    request_id: str
-
-
-# === Session (Step 2) ===
-class SessionCreateRequest(BaseModel):
-    config: Optional[Config] = None
-    rand_seed: Optional[int] = None
-
-
-class SessionCreateResponse(BaseModel):
-    session_id: str
-    map: List[List[int]]
-    enemy_state: PlayerState
-    enemy_memory: EnemyMemory
-    player_state: PlayerState
-    turn: int = 1
-    config: Optional[Config] = None
-
 
 class PlayerOrders(BaseModel):
     carrier_target: Optional[Position] = None
     launch_target: Optional[Position] = None
-
-
-class SessionStepRequest(BaseModel):
-    # Player commands for server-side resolution
-    player_orders: Optional[PlayerOrders] = None
-    config: Optional[Config] = None
-
-
-class StepEffects(BaseModel):
-    player_carrier_damage: int = 0
-
-
-class GameStatus(BaseModel):
-    turn: int
-    over: bool = False
-    result: Optional[Literal['win','lose','draw']] = None
-    message: Optional[str] = None
-
-class SessionStepResponse(BaseModel):
-    session_id: str
-    turn: int
-    # Keep these for introspection/compat
-    carrier_order: Optional[CarrierOrder] = None
-    squadron_orders: List[SquadronOrder] = []
-    # Authoritative enemy state after applying orders and progression
-    enemy_state: PlayerState
-    player_state: PlayerState
-    enemy_memory_out: Optional[EnemyMemory] = None
-    effects: StepEffects = StepEffects()
-    logs: List[str] = []
-    metrics: Dict[str, Any] = {}
-    request_id: str
-    turn_visible: List[str] = []
-    game_status: Optional[GameStatus] = None
-    # Player intel (server-computed memory based on visibility)
-    player_intel: Optional[PlayerIntel] = None
-    # Symmetric enemy intel (what enemy knows about player), optional for future clients
-    enemy_intel: Optional[PlayerIntel] = Field(default=None, exclude=True)
 
 
 # === PvP Match (skeleton) ===
