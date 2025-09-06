@@ -33,7 +33,7 @@ class TestAICarrierBotMedium(unittest.TestCase):
     def _ai_step(self):
         # AI視点のstateを作って渡す → 提出 → サーバ側を1ターン進める（人間側はオーダー無し）
         payload = self.match.build_state_payload(viewer_side=self.bot.side)
-        asyncio.run(self.bot.think(payload))
+        self.bot.think(payload)
         # 人間側は未提出のまま。テストでは直接ターンを進める。
         self.match._resolve_turn_minimal()
         # 次ターンへ向けてクリア

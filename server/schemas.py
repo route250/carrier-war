@@ -132,9 +132,6 @@ class Position(BaseModel,frozen=True):
         dy = other.y - self.y
         return math.atan2(dy, dx)
 
-class TrackPos(Position, frozen=True):
-    range:int
-
 class UnitState(BaseModel):
     id: str
     side: str
@@ -205,9 +202,6 @@ class SquadronState(UnitState):
         return super().is_active() and self.state != "lost" and self.state != 'base'
 
 
-
-
-
 class Config(BaseModel):
     difficulty: Optional[Literal["easy", "normal", "hard"]] = "normal"
     time_ms: Optional[int] = 50
@@ -270,6 +264,56 @@ class MatchStateResponse(BaseModel):
     status: MatchStatus
 
 
+class PayloadUnit(BaseModel):
+    """UnitHolder.to_payload 用のPydanticモデル。
+    自軍/敵軍いずれでも利用できる最小公倍のサマリ構造。
+    """
+    id: str
+    hp: int
+    max_hp: int
+    # 位置（非アクティブ時や敵推定時は None）
+    x: Optional[int] = None
+    y: Optional[int] = None
+    # そのターン内の移動開始位置（見えていれば）
+    x0: Optional[int] = None
+    y0: Optional[int] = None
+    # 自軍向けの詳細（敵側では通常 None）
+    vision: Optional[int] = None
+    speed: Optional[int] = None
+    fuel: Optional[int] = None
+    state: Optional[Literal["base", "outbound", "engaging", "returning", "lost"]] = None
+    target: Optional[Position] = None
+
+class SideViewPayload(BaseModel):
+    """1視点（自軍/敵軍）における公開情報の入れ物"""
+    carrier: Optional[PayloadUnit] = None
+    squadrons: Optional[List[PayloadUnit]] = None
+    turn_visible: Optional[List[str]] = None
+
+
+# --- Realtime/SSE payload models ---
+# クライアントに配信する詳細な状態（SSE向け）。
+# 既存の to_payload が dict を返すため、型は緩めに保つ。
+WaitingFor = Literal["none", "orders", "you", "opponent"]
+
+class MatchStatePayload(BaseModel):
+    type: Literal["state"] = "state"
+    match_id: str
+    status: MatchStatus
+    turn: int
+    waiting_for: WaitingFor = "none"
+    map_w: int
+    map_h: int
+    map: Optional[List[List[int]]] = None  # タイル情報（0:海, 1:陸地)
+    # 自軍/敵軍ビュー
+    units: SideViewPayload
+    intel: SideViewPayload
+    # 直近ターンのログ（視点別）
+    logs: Optional[List[str]] = None
+    # 結果（視点別 win/lose/draw）
+    result: Optional[Literal["win", "lose", "draw"]] = None
+
+
 class MatchOrdersRequest(BaseModel):
     player_token: str
     player_orders: Optional[PlayerOrders] = None
@@ -282,33 +326,3 @@ class MatchOrdersResponse(BaseModel):
     status: MatchStatus
     logs: List[str] = []
 
-class IntelPath(BaseModel):
-    """索敵結果"""
-    side: str
-    unit_id: str
-    turn: int
-    p1: Position
-    p2: Position
-
-class IntelReport(BaseModel):
-    """索敵報告"""
-    turn: int
-    side: str
-    logs: List[str] = []
-    units: List[UnitState] = []
-    intel: dict[str,IntelPath] = {}
-
-    def dump(self):
-        yield f"side: {self.side} turn: {self.turn}"
-        for log in self.logs:
-            yield f"  log: {log}"
-        for unit in self.units:
-            if isinstance(unit,CarrierState):
-                yield f"  unit: {unit.id} pos: {unit.pos} hp: {unit.hp}"
-            elif isinstance(unit,SquadronState):
-                loc = f"{unit.state}"
-                if unit.pos.is_valid():
-                    loc = loc + f"({unit.pos.x},{unit.pos.y})"
-                yield f"  unit: {unit.id} {loc} hp: {unit.hp}"
-        for path in self.intel.values():
-            yield f"  intel: {path.unit_id} from {path.p1} to {path.p2}"

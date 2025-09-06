@@ -23,7 +23,7 @@ class TestCarrierMoveAdvanced(unittest.TestCase):
         # 1. オーダーなしで移動しない
         self.match.side_a.orders = None
         self.match.side_b.orders = None
-        self.store._resolve_turn_minimal(self.match)
+        self.match._resolve_turn_minimal()
         self.assertEqual((self.carrier.pos.x, self.carrier.pos.y), (self.init_pos.x, self.init_pos.y))
 
     def test_far_order_moves(self):
@@ -32,7 +32,7 @@ class TestCarrierMoveAdvanced(unittest.TestCase):
         orders = {'carrier_target': target}
         self.match.side_a.orders = orders
         self.match.side_b.orders = orders
-        self.store._resolve_turn_minimal(self.match)
+        self.match._resolve_turn_minimal()
         self.assertNotEqual((self.carrier.pos.x, self.carrier.pos.y), (self.init_pos.x, self.init_pos.y))
 
     def test_multi_step_to_target(self):
@@ -44,7 +44,7 @@ class TestCarrierMoveAdvanced(unittest.TestCase):
         reached = False
         max_turns = 10
         for _ in range(max_turns):
-            self.store._resolve_turn_minimal(self.match)
+            self.match._resolve_turn_minimal()
             if (self.carrier.pos.x, self.carrier.pos.y) == (target['x'], target['y']):
                 reached = True
                 break
@@ -57,12 +57,12 @@ class TestCarrierMoveAdvanced(unittest.TestCase):
         self.match.side_a.orders = orders
         self.match.side_b.orders = orders
         for _ in range(10):
-            self.store._resolve_turn_minimal(self.match)
+            self.match._resolve_turn_minimal()
         pos = (self.carrier.pos.x, self.carrier.pos.y)
         self.assertEqual(pos, (target['x'], target['y']))
         # さらにターン進行しても動かない
         for _ in range(3):
-            self.store._resolve_turn_minimal(self.match)
+            self.match._resolve_turn_minimal()
             self.assertEqual((self.carrier.pos.x, self.carrier.pos.y), pos)
 
     def test_change_target_midway(self):
@@ -72,7 +72,7 @@ class TestCarrierMoveAdvanced(unittest.TestCase):
         self.match.side_a.orders = orders1
         self.match.side_b.orders = orders1
         for _ in range(3):
-            self.store._resolve_turn_minimal(self.match)
+            self.match._resolve_turn_minimal()
         pos_mid = (self.carrier.pos.x, self.carrier.pos.y)
         # 6. 途中で新しいオーダー
         target2 = {'x': self.init_pos.x + 2, 'y': self.init_pos.y + 2}
@@ -80,7 +80,7 @@ class TestCarrierMoveAdvanced(unittest.TestCase):
         self.match.side_a.orders = orders2
         self.match.side_b.orders = orders2
         for _ in range(10):
-            self.store._resolve_turn_minimal(self.match)
+            self.match._resolve_turn_minimal()
             if (self.carrier.pos.x, self.carrier.pos.y) == (target2['x'], target2['y']):
                 break
         self.assertEqual((self.carrier.pos.x, self.carrier.pos.y), (target2['x'], target2['y']))
@@ -95,7 +95,7 @@ class TestCarrierMoveAdvanced(unittest.TestCase):
         self.match.side_a.orders = orders
         self.match.side_b.orders = orders
         # 1ターン目で発艦するはず
-        self.store._resolve_turn_minimal(self.match)
+        self.match._resolve_turn_minimal()
         sq = next((s for s in self.match.a_state.squadrons if s.state != 'base'), None)
         self.assertIsNotNone(sq, "発艦した航空機が存在しません")
         # ある程度ターンを進めて、最終的に基地に戻ることを確認（失われた場合は失敗）
@@ -104,7 +104,7 @@ class TestCarrierMoveAdvanced(unittest.TestCase):
         for _ in range(max_turns):
             self.match.side_a.orders = None
             self.match.side_b.orders = None
-            self.store._resolve_turn_minimal(self.match)
+            self.match._resolve_turn_minimal()
             if sq.state == 'base' and not sq.is_active():
                 returned = True
                 break

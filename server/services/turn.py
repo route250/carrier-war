@@ -1,6 +1,7 @@
 
+from dataclasses import dataclass, field
 from server.schemas import PlayerOrders
-from server.schemas import Position, UnitState, CarrierState, SquadronState, IntelPath, IntelReport
+from server.schemas import Position, UnitState, CarrierState, SquadronState, PayloadUnit, SideViewPayload
 from server.schemas import SQUAD_MAX_HP, CARRIER_MAX_HP
 from server.services.hexmap import HexArray
 from server.utils.audit import match_write
@@ -41,49 +42,39 @@ class UnitHolder:
         self.path = [self.unit.pos] if self.unit.is_active() else []
         self.intel = {}
 
-    def to_payload(self, side:str|None) -> dict|None:
+    def to_payload(self, side:str|None) -> PayloadUnit|None:
         if side is None or side == self.side:
-            result = {
-                'id': self.unit.id,
-                'hp': self.unit.hp,
-                'max_hp': self.unit.max_hp,
-                'vision': self.unit.vision,
-                'speed': self.unit.speed,
-                'fuel': self.unit.fuel,
-            }
-            if isinstance(self.unit, SquadronState):
-                result.update({
-                    'state': self.unit.state,
-                })
-            result.update({
-                'x': self.unit.pos.x if self.unit.is_active() else None,
-                'y': self.unit.pos.y if self.unit.is_active() else None,})
+            result = PayloadUnit(
+                id=self.unit.id,
+                hp=self.unit.hp,
+                max_hp=self.unit.max_hp,
+                vision=self.unit.vision,
+                speed=self.unit.speed,
+                fuel=self.unit.fuel,
+                state=(self.unit.state if isinstance(self.unit, SquadronState) else None),
+                x=(self.unit.pos.x if self.unit.is_active() else None),
+                y=(self.unit.pos.y if self.unit.is_active() else None),
+            )
             if self.unit.is_active():
                 if self.path:
-                    result.update({
-                        'x0': self.path[0].x,
-                        'y0': self.path[0].y,
-                    })
+                    result.x0 = self.path[0].x
+                    result.y0 = self.path[0].y
                 if self.unit.target:
-                    result.update({
-                        'target': {'x': self.unit.target.x, 'y': self.unit.target.y}
-                    })
+                    result.target = self.unit.target
             return result
         elif self.intel:
             pos_list = [p for t,p in sorted(self.intel.items())]
             first_seen = pos_list[0]
             last_seen = pos_list[-1]
-            result = {
-                'id': self.unit.id,
-                'hp': self.unit.hp,
-                'max_hp': self.unit.max_hp,
-                'x': last_seen.x,
-                'y': last_seen.y,
-            }
-            result.update({
-                'x0': first_seen.x,
-                'y0': first_seen.y,
-            })
+            result = PayloadUnit(
+                id=self.unit.id,
+                hp=self.unit.hp,
+                max_hp=self.unit.max_hp,
+                x=last_seen.x,
+                y=last_seen.y,
+                x0=first_seen.x,
+                y0=first_seen.y,
+            )
             return result
 
     def to_turn_visible(self, side: str | None) -> set[Position]:
@@ -114,6 +105,39 @@ def scaled_damage(hp: int, max_hp:int, base: int) -> int:
     variance = round(base * 0.2)
     raw = base + (0 if variance == 0 else random.randint(-variance, variance))
     return max(0, round(raw * scale))
+
+@dataclass
+class IntelPath:
+    """索敵結果"""
+    side: str
+    unit_id: str
+    turn: int
+    p1: Position
+    p2: Position
+
+@dataclass
+class IntelReport:
+    """索敵報告"""
+    turn: int
+    side: str
+    logs: list[str] = field(default_factory=list)
+    intel: dict[str,IntelPath] = field(default_factory=dict)
+
+    def dump(self, board: 'GameBord'):
+        yield f"side: {self.side} turn: {self.turn}"
+        for log in self.logs:
+            yield f"  log: {log}"
+        for hld in board.units_list:
+            unit = hld.unit
+            if isinstance(unit,CarrierState):
+                yield f"  unit: {unit.id} pos: {unit.pos} hp: {unit.hp}"
+            elif isinstance(unit,SquadronState):
+                loc = f"{unit.state}"
+                if unit.pos.is_valid():
+                    loc = loc + f"({unit.pos.x},{unit.pos.y})"
+                yield f"  unit: {unit.id} {loc} hp: {unit.hp}"
+        for path in self.intel.values():
+            yield f"  intel: {path.unit_id} from {path.p1} to {path.p2}"
 
 class GameBord:
     def __init__(self, hexmap: HexArray, units_list:list[list[UnitState]], *, log_id: str | None = None):
@@ -211,7 +235,7 @@ class GameBord:
                 msgs.append(f"Launch target {orders.launch_target} is out of squadron range.")
         return msgs
 
-    def to_payload(self, view_side:str|None=None) -> tuple[dict,dict]:
+    def to_payload(self, view_side:str|None=None) -> tuple[SideViewPayload,SideViewPayload]:
         side = view_side if view_side in ['A','B'] else 'A'
         my_carrier = None
         my_squadrons = []
@@ -242,22 +266,22 @@ class GameBord:
                     if 0 <= pos.x < self.hexmap.W and 0 <= pos.y < self.hexmap.H:
                         other_turn_visible.add(pos)
 
-        my_result = {}
+        my_result = SideViewPayload()
         if my_carrier is not None:
-            my_result['carrier'] = my_carrier
+            my_result.carrier = my_carrier
         if my_squadrons:
-            my_result['squadrons'] = my_squadrons
+            my_result.squadrons = my_squadrons
         if my_turn_visible:
             vlist = sorted(list(my_turn_visible))
-            my_result['turn_visible'] = [ f"{p.x},{p.y}" for p in vlist ]
-        other_result = {}
+            my_result.turn_visible = [ f"{p.x},{p.y}" for p in vlist ]
+        other_result = SideViewPayload()
         if other_carrier is not None:
-            other_result['carrier'] = other_carrier
+            other_result.carrier = other_carrier
         if other_squadrons:
-            other_result['squadrons'] = other_squadrons
+            other_result.squadrons = other_squadrons
         if other_turn_visible:
             vlist = sorted(list(other_turn_visible))
-            other_result['turn_visible'] = [ f"{p.x},{p.y}" for p in vlist ]
+            other_result.turn_visible = [ f"{p.x},{p.y}" for p in vlist ]
         return my_result, other_result
 
     def _get_carrier_by_side(self, side: str) -> tuple[int,int]:
@@ -283,9 +307,6 @@ class GameBord:
 
     def get_squadrons_by_side(self, side: str) -> list[SquadronState]:
         return [u.unit for u in self.units_list if u.side == side and isinstance(u.unit, SquadronState)]
-
-    def get_intel_by_side(self, side: str) -> IntelReport:
-        return self.intel.get(side, IntelReport(side=side, turn=0))
 
     def turn_forward(self, orders:list[PlayerOrders]) -> dict[str,IntelReport]:
         logs:dict[str,list[str]] = {}
@@ -499,8 +520,6 @@ class GameBord:
         for i, side in enumerate(["A","B"]):
             report = IntelReport(side=side, turn=self.turn)
             report.logs = logs.get(side, [])
-            # 自軍ユニット情報
-            report.units = [u.unit for u in self.units_list if u.side == side]
             # 索敵結果
             for u in self.units_list:
                 if u.side != side and u.unit.is_active() and u.intel:

@@ -24,7 +24,7 @@ import random
 
 from server.services.ai_base import AIThreadABC
 
-from server.schemas import Config, PlayerOrders, Position, UnitState, CarrierState, SquadronState
+from server.schemas import Config, MatchStatePayload, PlayerOrders, Position, UnitState, CarrierState, SquadronState
 
 from server.schemas import (
     CARRIER_MAX_HP,
@@ -283,24 +283,24 @@ class CarrierBotMedium(AIThreadABC):
         self._memory: Optional[EnemyMemory] = None
         self._config: Optional[Config] = config
 
-    async def think(self, payload: dict) -> None:  # type: ignore[override]
+    def think(self, payload: MatchStatePayload) -> None:  # type: ignore[override]
         # 1) 地形マップを確保（初回のみ）
         if self._map is None:
             try:
                 snap = self.store.snapshot(self.match_id, self.token)
-                self._map = snap.get("map")
+                self._map = snap.map
             except Exception:
                 self._map = None
         if not self._map:
             # マップが無ければ安全策として何も出さない
-            await self.on_orders(PlayerOrders())
+            self.on_orders(PlayerOrders())
             return
 
         # 2) state payload から自軍（AI側）状態を復元
         enemy_state = self._payload_to_player_state(payload)
         if enemy_state is None:
             # 復元できない場合はノーオーダー
-            await self.on_orders(PlayerOrders())
+            self.on_orders(PlayerOrders())
             return
 
         # 3) PlayerObservation（任意）: 可視編隊のみ最小反映（なければ None でOK）
@@ -308,7 +308,7 @@ class CarrierBotMedium(AIThreadABC):
 
         # 4) 既存AIへ入力してオーダーを算出
         req = PlanRequest(
-            turn=int(payload.get("turn", 1)),
+            turn=payload.turn,
             map=self._map,
             enemy_state=enemy_state,
             enemy_memory=self._memory,
@@ -325,43 +325,43 @@ class CarrierBotMedium(AIThreadABC):
         self._memory = resp.enemy_memory_out or self._memory
 
         # 6) サーバへ提出
-        await self.on_orders(orders)
+        self.on_orders(orders)
 
     # --- helpers ---
-    def _payload_to_player_state(self, payload: dict) -> Optional[PlayerState]:
+    def _payload_to_player_state(self, payload: MatchStatePayload) -> Optional[PlayerState]:
         try:
-            units = payload.get("units", {})
-            carr = units.get("carrier")
+            units = payload.units
+            carr = units.carrier
             if not carr:
                 return None
-            cx = carr.get("x")
-            cy = carr.get("y")
+            cx = carr.x
+            cy = carr.y
             if cx is None or cy is None:
                 return None
             carrier = CarrierState(
-                id=carr.get("id") or "C",
+                id=carr.id or "C",
                 side=self.side or "B",
                 pos=Position(x=int(cx), y=int(cy)),
-                hp=int(carr.get("hp")) if carr.get("hp") is not None else CARRIER_MAX_HP,
-                max_hp=int(carr.get("max_hp")) if carr.get("max_hp") is not None else CARRIER_MAX_HP,
-                speed=int(carr.get("speed")) if carr.get("speed") is not None else CARRIER_SPEED,
-                fuel=int(carr.get("fuel")) if carr.get("fuel") is not None else CARRIER_RANGE,
-                vision=int(carr.get("vision")) if carr.get("vision") is not None else VISION_CARRIER,
+                hp=int(carr.hp) if carr.hp is not None else CARRIER_MAX_HP,
+                max_hp=int(carr.max_hp) if carr.max_hp is not None else CARRIER_MAX_HP,
+                speed=int(carr.speed) if carr.speed is not None else CARRIER_SPEED,
+                fuel=int(carr.fuel) if carr.fuel is not None else CARRIER_RANGE,
+                vision=int(carr.vision) if carr.vision is not None else VISION_CARRIER,
             )
 
             sq_list = []
-            for sq in units.get("squadrons", []) or []:
-                pos_x = sq.get("x")
-                pos_y = sq.get("y")
+            for sq in units.squadrons or []:
+                pos_x = sq.x
+                pos_y = sq.y
                 squad = SquadronState(
-                    id=sq.get("id") or "SQ",
+                    id=sq.id or "SQ",
                     side=self.side or "B",
-                    hp=int(sq.get("hp")) if sq.get("hp") is not None else SQUAD_MAX_HP,
-                    max_hp=int(sq.get("max_hp")) if sq.get("max_hp") is not None else SQUAD_MAX_HP,
-                    speed=int(sq.get("speed")) if sq.get("speed") is not None else SQUAD_SPEED,
-                    fuel=int(sq.get("fuel")) if sq.get("fuel") is not None else SQUADRON_RANGE,
-                    vision=int(sq.get("vision")) if sq.get("vision") is not None else VISION_SQUADRON,
-                    state=str(sq.get("state") or "base"),
+                    hp=int(sq.hp) if sq.hp is not None else SQUAD_MAX_HP,
+                    max_hp=int(sq.max_hp) if sq.max_hp is not None else SQUAD_MAX_HP,
+                    speed=int(sq.speed) if sq.speed is not None else SQUAD_SPEED,
+                    fuel=int(sq.fuel) if sq.fuel is not None else SQUADRON_RANGE,
+                    vision=int(sq.vision) if sq.vision is not None else VISION_SQUADRON,
+                    state=str(sq.state or "base"),
                 )
                 if pos_x is not None and pos_y is not None:
                     squad.pos = Position(x=int(pos_x), y=int(pos_y))
@@ -371,7 +371,7 @@ class CarrierBotMedium(AIThreadABC):
         except Exception:
             return None
 
-    def _payload_to_player_observation(self, payload: dict) -> Optional[PlayerObservation]:
+    def _payload_to_player_observation(self, payload: MatchStatePayload) -> Optional[PlayerObservation]:
         try:
             # 現状の state には敵編隊の最小情報を返す設計（intel）だが、
             # ここでは安全側へ倒して None または空観測を返す。

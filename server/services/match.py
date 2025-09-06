@@ -13,7 +13,7 @@ from typing import Dict, Optional
 
 from server.schemas import (
     Config,
-    IntelReport,
+    MatchStatePayload,
     MatchCreateRequest,
     MatchCreateResponse,
     MatchJoinRequest,
@@ -34,7 +34,7 @@ from server.schemas import (
 
 from server.services.ai_base import AIThreadABC
 from server.services.ai_cpu import CarrierBotMedium
-from server.services.turn import GameBord
+from server.services.turn import GameBord, IntelReport
 
 # Debug flag: enable when running tests or when env var CARRIER_WAR_DEBUG is set
 DEBUG = bool(os.getenv('CARRIER_WAR_DEBUG')) or ('unittest' in sys.modules) or ('PYTEST_CURRENT_TEST' in os.environ)
@@ -62,7 +62,6 @@ class Match:
     side_a: PlayerSlot = field(default_factory=PlayerSlot)
     side_b: PlayerSlot = field(default_factory=PlayerSlot)
     ai_threads: list[Optional[AIThreadABC]] = field(default_factory=list)
-    ai_tasks: list[Optional[asyncio.Task]] = field(default_factory=list)
     lock: Lock = field(default_factory=Lock, repr=False)
     subscribers_map: dict[asyncio.Queue[str], Optional[str]] = field(default_factory=dict, repr=False)
     last_report: Optional[dict[str, IntelReport]] = None
@@ -76,14 +75,6 @@ class Match:
             except Exception:
                 pass
         self.ai_threads = []
-        # Cancel AI tasks
-        for task in self.ai_tasks:
-            try:
-                if task and not task.done():
-                    task.cancel()
-            except Exception:
-                pass
-        self.ai_tasks = []
 
     def has_open_slot(self) -> bool:
         return not self.side_a.token or not self.side_b.token
@@ -123,11 +114,12 @@ class Match:
         if self.map.is_over():
             self.status = "over"
 
-    def get_state(self, token:str|None ) -> dict:
+    def get_state(self, token:str|None ) -> MatchStatePayload:
         side = self.side_for_token(token) if token else None
+        # API は従来通り dict を返す
         return self.build_state_payload(viewer_side=side)
 
-    def build_state_payload(self, viewer_side: Optional[str] = None) -> dict:
+    def build_state_payload(self, viewer_side: Optional[str] = None) -> MatchStatePayload:
         waiting_for = "none"
         if self.status == "active":
             a_has = self.side_a.orders is not None
@@ -142,37 +134,36 @@ class Match:
         aw = self.map.W
         ah = self.map.H
         my_units, other_units = self.map.to_payload(viewer_side)
-
-        result_dict = {
-            "type": "state",
-            "match_id": self.match_id,
-            "status": self.status,
-            "turn": self.map.turn,
-            "waiting_for": waiting_for,
-            "map_w": aw,
-            "map_h": ah,
-            "units": my_units,
-            "intel": other_units,
-        }
+        # 一旦モデルを作成
+        payload = MatchStatePayload(
+            match_id=self.match_id,
+            status=self.status,
+            turn=self.map.turn,
+            waiting_for=waiting_for,  # type: ignore[arg-type]
+            map_w=aw,
+            map_h=ah,
+            units=my_units,  # type: ignore[arg-type]
+            intel=other_units,  # type: ignore[arg-type]
+        )
         # Attach per-viewer logs (previous turn) if available
         try:
             if viewer_side in ("A", "B") and self.last_report is not None:
                 rep = self.last_report.get(viewer_side)
                 if rep and getattr(rep, "logs", None):
                     # クライアント側で重複追加を避けるため、常に最新ターンのstateに含めるだけにする
-                    result_dict["logs"] = list(rep.logs)
+                    payload.logs = list(rep.logs)
         except Exception:
             pass
 
         if self.status == "over":
             if self.map.get_result() == viewer_side:
-                result_dict["result"] = "win"
+                payload.result = "win"
             elif self.map.get_result() is None:
-                result_dict["result"] = "draw"
+                payload.result = "draw"
             else:
-                result_dict["result"] = "lose"
+                payload.result = "lose"
 
-        return result_dict
+        return payload
 
 
     def _broadcast_state(self) -> None:
@@ -183,7 +174,7 @@ class Match:
                     try:
                         side = self.side_for_token(token) if token else None
                         payload = self.build_state_payload(viewer_side=side)
-                        data = json.dumps(payload, ensure_ascii=False)
+                        data = json.dumps(payload.model_dump(), ensure_ascii=False)
                         q.put_nowait(data)
                     except Exception:
                         pass
@@ -233,9 +224,8 @@ class MatchStore:
                 bot = CarrierBotMedium(store=self, match_id=mid, name=f"CPU({label})", config=req.config)
                 m.ai_threads.append(bot)
                 # 常に専用スレッドでAIを起動（イベントループ有無に依存しない）
-                t = threading.Thread(target=lambda: asyncio.run(bot.run()), daemon=True)
+                t = threading.Thread(target=bot.run, daemon=True)
                 t.start()
-                m.ai_tasks.append(None)
             except Exception:
                 traceback.print_exc()
 
@@ -291,7 +281,7 @@ class MatchStore:
     def state(self, match_id: str, token: Optional[str] = None) -> MatchStateResponse:
         m = self._matches[match_id]
         payload = m.get_state(token)
-        ret = MatchStateResponse(**payload)
+        ret = MatchStateResponse( match_id=payload.match_id, turn=payload.turn, status=payload.status )
         return ret
     
         # --- SSE Subscribe/Unsubscribe and broadcast ---
@@ -303,12 +293,12 @@ class MatchStore:
             m.subscribers_map[q] = token
         return q
 
-    def snapshot(self, match_id: str, token: Optional[str] = None) -> dict:
+    def snapshot(self, match_id: str, token: Optional[str] = None) -> MatchStatePayload:
         """ first data for sse session"""
         m = self._matches[match_id]
         side = m.side_for_token(token) if token else None
         payload = m.build_state_payload(viewer_side=side)
-        payload["map"] = m.map.get_map_array()
+        payload.map = m.map.get_map_array()
         return payload
 
     def unsubscribe(self, match_id: str, q: asyncio.Queue[str]) -> None:

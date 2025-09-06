@@ -85,7 +85,7 @@ async def match_events(match_id: str, token: str | None = Query(default=None)):
             # initial state push (personalized by token)
             try:
                 st = store.snapshot(match_id, token)
-                yield "event: state\n" + "data: " + json.dumps(st, ensure_ascii=False) + "\n\n"
+                yield "event: state\n" + "data: " + json.dumps(st.model_dump(), ensure_ascii=False) + "\n\n"
             except Exception:
                 pass
             while True:

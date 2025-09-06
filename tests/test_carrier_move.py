@@ -21,7 +21,7 @@ class TestCarrierMove(unittest.TestCase):
         self.match.side_a.orders = orders
         self.match.side_b.orders = orders  # 両方揃えないと進行しない
         # ターン進行
-        self.store._resolve_turn_minimal(self.match)
+        self.match._resolve_turn_minimal()
         # carrierがNoneでないことを確認
         assert self.match.a_state is not None, "a_stateがNoneです"
         assert hasattr(self.match.a_state, "carrier"), "a_stateにcarrier属性がありません"

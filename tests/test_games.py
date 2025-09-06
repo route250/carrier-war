@@ -1,11 +1,11 @@
 import sys,os
 if __name__ == "__main__":
     sys.path.append(os.path.join(os.path.dirname(__file__), '..'))
-from server.schemas import SessionStepRequest, PlayerOrders
-from server.schemas import Position, UnitState, CarrierState, SquadronState, IntelPath, IntelReport
+from server.schemas import PlayerOrders
+from server.schemas import Position, UnitState, CarrierState, SquadronState
 from server.services.hexmap import HexArray
 
-from server.services.turn import GameBord
+from server.services.turn import GameBord, IntelReport
 
 from server.services.match import create_units
 
@@ -49,7 +49,7 @@ def gamex():
 
     for side, report in result.items():
         print(f"--- Logs for side {side} ---")
-        for entry in report.dump():
+        for entry in report.dump(board):
             print(entry)
         print()
 
@@ -68,7 +68,7 @@ def gamex():
         orders = EMPTY_ORDER
         for side, report in result.items():
             print(f"--- Logs for side {side} ---")
-            for entry in report.dump():
+            for entry in report.dump(board):
                 print(entry)
             print()
 
@@ -129,7 +129,7 @@ def test_squadron_return():
     hexmap = HexArray(30,30)
     a_units = create_units("A", 3,3 )
     b_units = create_units("B", 27,27 )
-    bord = GameBord(hexmap, [a_units, b_units], log_id='debug' )
+    board = GameBord(hexmap, [a_units, b_units], log_id='debug' )
     # マップが全て0であることを確認
     assert all(all(cell == 0 for cell in row) for row in hexmap.copy_as_list()), "マップが全て0ではありません"
     # 最初は航空部隊はbase状態のはず
@@ -156,12 +156,12 @@ def test_squadron_return():
     ]
     a = 0
     for i in range(1,35):
-        assert i == bord.turn, f"ターン番号が不正です: {bord.turn} != {i}"
-        result = bord.turn_forward(orders)
+        assert i == board.turn, f"ターン番号が不正です: {board.turn} != {i}"
+        result = board.turn_forward(orders)
         orders = EMPTY_ORDER
         for side, report in result.items():
             print(f"--- Logs for side {side} ---")
-            for entry in report.dump():
+            for entry in report.dump(board):
                 print(entry)
             print()
         if a==0 and sq1.pos == target_pos:
