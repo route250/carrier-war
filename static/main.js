@@ -142,6 +142,10 @@ function initApp() {
 
   // PvP lobby actions
   el.btnCreateMatch?.addEventListener('click', createMatch);
+  // CPU (PvE via match engine) quick buttons
+  document.getElementById('btnCreateCpuEasy')?.addEventListener('click', () => createCpuMatch('easy'));
+  document.getElementById('btnCreateCpuMedium')?.addEventListener('click', () => createCpuMatch('normal'));
+  document.getElementById('btnCreateCpuHard')?.addEventListener('click', () => createCpuMatch('hard'));
 
   // Match room actions
   el.btnLeaveMatch?.addEventListener('click', leaveMatchToLobby);
@@ -184,6 +188,20 @@ async function createMatch() {
     openMatchRoom();
   } catch (e) {
     alert('マッチ作成に失敗しました');
+  }
+}
+
+async function createCpuMatch(difficulty = 'normal') {
+  const name = APP.username || 'Player';
+  try {
+    const body = { mode: 'pve', display_name: name, config: { difficulty } };
+    const res = await fetch('/v1/match/', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) });
+    if (!res.ok) throw new Error(`status ${res.status}`);
+    const json = await res.json();
+    APP.match = { id: json.match_id, token: json.player_token, side: json.side };
+    openMatchRoom();
+  } catch (e) {
+    alert('CPUマッチ作成に失敗しました');
   }
 }
 

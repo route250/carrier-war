@@ -1,6 +1,9 @@
 import time
+import traceback
 import uuid
 import asyncio
+import threading
+import traceback
 import json
 import os
 import sys
@@ -29,6 +32,8 @@ from server.schemas import (
     PlayerOrders,
 )
 
+from server.services.ai_thread import AIThreadABC
+from server.services.ai_cpu import CarrierBotMedium
 from server.services.turn import GameBord
 
 # Debug flag: enable when running tests or when env var CARRIER_WAR_DEBUG is set
@@ -56,9 +61,29 @@ class Match:
     created_at: int = field(default_factory=lambda: int(time.time()))
     side_a: PlayerSlot = field(default_factory=PlayerSlot)
     side_b: PlayerSlot = field(default_factory=PlayerSlot)
+    ai_threads: list[Optional[AIThreadABC]] = field(default_factory=list)
+    ai_tasks: list[Optional[asyncio.Task]] = field(default_factory=list)
     lock: Lock = field(default_factory=Lock, repr=False)
     subscribers_map: dict[asyncio.Queue[str], Optional[str]] = field(default_factory=dict, repr=False)
     last_report: Optional[dict[str, IntelReport]] = None
+
+    def close(self):
+        # Stop AI threads
+        for thread in self.ai_threads:
+            try:
+                if thread and thread.is_alive():
+                    thread.stop()
+            except Exception:
+                pass
+        self.ai_threads = []
+        # Cancel AI tasks
+        for task in self.ai_tasks:
+            try:
+                if task and not task.done():
+                    task.cancel()
+            except Exception:
+                pass
+        self.ai_tasks = []
 
     def has_open_slot(self) -> bool:
         return not self.side_a.token or not self.side_b.token
@@ -99,7 +124,8 @@ class Match:
             self.status = "over"
 
     def get_state(self, token:str|None ) -> dict:
-        return self.build_state_payload()
+        side = self.side_for_token(token) if token else None
+        return self.build_state_payload(viewer_side=side)
 
     def build_state_payload(self, viewer_side: Optional[str] = None) -> dict:
         waiting_for = "none"
@@ -151,17 +177,25 @@ class Match:
 
     def _broadcast_state(self) -> None:
         try:
-            if len(self.subscribers_map) == 0:
-                return
-            subs = dict(self.subscribers_map)
-            for q,token in subs.items():
-                try:
-                    side = self.side_for_token(token) if token else None
-                    payload = self.build_state_payload(viewer_side=side)
-                    data = json.dumps(payload, ensure_ascii=False)
-                    q.put_nowait(data)
-                except Exception:
-                    pass
+            if len(self.subscribers_map) > 0:
+                subs = dict(self.subscribers_map)
+                for q,token in subs.items():
+                    try:
+                        side = self.side_for_token(token) if token else None
+                        payload = self.build_state_payload(viewer_side=side)
+                        data = json.dumps(payload, ensure_ascii=False)
+                        q.put_nowait(data)
+                    except Exception:
+                        pass
+            if self.ai_threads:
+                for thread in self.ai_threads:
+                    try:
+                        if thread and thread.is_alive():
+                            payload = self.build_state_payload(viewer_side=thread.side)
+                            thread.put_payload(payload)
+                    finally:
+                        pass
+
         except Exception:
             pass
 
@@ -190,6 +224,20 @@ class MatchStore:
 
         # broadcast lobby list update
         self._broadcast_lobby_list()
+
+        if req.mode == "pve":
+            try:
+                # PvE時はCPUボット起動。難易度は config.difficulty を参照（未指定は 'normal'）。
+                diff = (req.config.difficulty if (req.config and req.config.difficulty) else 'normal')
+                label = 'Medium' if diff not in ('easy','hard') else ('Easy' if diff=='easy' else 'Hard')
+                bot = CarrierBotMedium(store=self, match_id=mid, name=f"CPU({label})", config=req.config)
+                m.ai_threads.append(bot)
+                # 常に専用スレッドでAIを起動（イベントループ有無に依存しない）
+                t = threading.Thread(target=lambda: asyncio.run(bot.run()), daemon=True)
+                t.start()
+                m.ai_tasks.append(None)
+            except Exception:
+                traceback.print_exc()
 
         return MatchCreateResponse(
             match_id=mid,
@@ -291,6 +339,9 @@ class MatchStore:
                             del self._matches[m.match_id]
                         except Exception:
                             pass
+                        #
+                        m.close()
+                        
                         self._broadcast_lobby_list()
                         return
                     # broadcast lobby list and updated state to remaining subscribers
@@ -344,6 +395,7 @@ class MatchStore:
                     del self._matches[m.match_id]
                 except Exception:
                     pass
+                m.close()
                 self._broadcast_lobby_list()
                 return
             # otherwise broadcast updates
