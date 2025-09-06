@@ -70,55 +70,53 @@ class Match:
             return "B"
         return None
 
+    def set_orders(self, token: str, orders: PlayerOrders|None) -> list[str]:
+
+        if self.status != "active":
+            return ["match not active"]
+        side = self.side_for_token(token)
+        if side != "A" and side != "B":
+            return ["invalid token"]
+        
+        # check carrier target validity
+        msg = self.map.validate_orders(side, orders)
+        if msg:
+            return msg
+        if side == "A":
+            self.side_a.orders = orders
+        elif side == "B":
+            self.side_b.orders = orders
+        else:
+            return ["invalid token"]
+        return []
+
     def _resolve_turn_minimal(self) -> None:
         # Move carriers towards targets if provided
         orders = [self.side_a.orders or PlayerOrders(), self.side_b.orders or PlayerOrders()]
         self.last_report = self.map.turn_forward(orders)  # use existing turn logic to apply orders
         # Check game over condition (any carrier destroyed)
-        try:
-            if self.map.is_over():
-                self.status = "over"
-        except Exception:
-            pass
+        if self.map.is_over():
+            self.status = "over"
+
+    def get_state(self, token:str|None ) -> dict:
+        return self.build_state_payload()
 
     def build_state_payload(self, viewer_side: Optional[str] = None) -> dict:
         waiting_for = "none"
         if self.status == "active":
             a_has = self.side_a.orders is not None
             b_has = self.side_b.orders is not None
-            if not a_has or not b_has:
-                if viewer_side == "A" and not a_has:
-                    waiting_for = "you"
-                elif viewer_side == "B" and not b_has:
+            if not a_has and not b_has:
+                waiting_for = "orders"
+            elif not a_has or not b_has:
+                if viewer_side == "A" and not a_has or viewer_side == "B" and not b_has:
                     waiting_for = "you"
                 else:
                     waiting_for = "opponent"
         aw = self.map.W
         ah = self.map.H
         my_units, other_units = self.map.to_payload(viewer_side)
-        if viewer_side and viewer_side != 'A':
-            a_units, b_units = other_units, my_units
-        else:
-            a_units, b_units = my_units, other_units
 
-        a_carrier =self.map.get_carrier_by_side("A")
-        b_carrier =self.map.get_carrier_by_side("B")
-
-        result = None
-        if self.status == "over":
-            try:
-                a_hp = a_carrier.hp if a_carrier else 0
-                b_hp = b_carrier.hp if b_carrier else 0
-                if a_hp <= 0 and b_hp <= 0:
-                    result = "draw"
-                elif viewer_side == "A":
-                    result = "lose" if a_hp <= 0 and b_hp > 0 else ("win" if b_hp <= 0 and a_hp > 0 else "draw")
-                elif viewer_side == "B":
-                    result = "lose" if b_hp <= 0 and a_hp > 0 else ("win" if a_hp <= 0 and b_hp > 0 else "draw")
-                else:
-                    result = "draw"
-            except Exception:
-                result = None
         result_dict = {
             "type": "state",
             "match_id": self.match_id,
@@ -127,8 +125,8 @@ class Match:
             "waiting_for": waiting_for,
             "map_w": aw,
             "map_h": ah,
-            "a": a_units,
-            "b": b_units,
+            "units": my_units,
+            "intel": other_units,
         }
         # Attach per-viewer logs (previous turn) if available
         try:
@@ -139,8 +137,15 @@ class Match:
                     result_dict["logs"] = list(rep.logs)
         except Exception:
             pass
-        if result:
-            result_dict["result"] = result
+
+        if self.status == "over":
+            if self.map.get_result() == viewer_side:
+                result_dict["result"] = "win"
+            elif self.map.get_result() is None:
+                result_dict["result"] = "draw"
+            else:
+                result_dict["result"] = "lose"
+
         return result_dict
 
 
@@ -235,24 +240,13 @@ class MatchStore:
             m._broadcast_state()
             return MatchJoinResponse(match_id=m.match_id, player_token=token, side=side, status=m.status)
 
-    def state(self, match_id: str, token: Optional[str]) -> MatchStateResponse:
+    def state(self, match_id: str, token: Optional[str] = None) -> MatchStateResponse:
         m = self._matches[match_id]
-        side = m.side_for_token(token) if token else None
-        payload = m.build_state_payload(viewer_side=side)
-        return MatchStateResponse(
-            match_id=m.match_id,
-            status=payload.get("status", m.status),
-            mode=m.mode,
-            turn=payload.get("turn", m.map.turn),
-            your_side=side,
-            waiting_for=payload.get("waiting_for", "none"),
-            map_w=payload.get("map_w"),
-            map_h=payload.get("map_h"),
-            a=payload.get("a"),
-            b=payload.get("b"),
-        )
-
-    # --- SSE Subscribe/Unsubscribe and broadcast ---
+        payload = m.get_state(token)
+        ret = MatchStateResponse(**payload)
+        return ret
+    
+        # --- SSE Subscribe/Unsubscribe and broadcast ---
     def subscribe(self, match_id: str, token: Optional[str]) -> asyncio.Queue[str]:
         """ start sse session """
         m = self._matches[match_id]
@@ -359,15 +353,12 @@ class MatchStore:
 
     def submit_orders(self, match_id: str, req: MatchOrdersRequest) -> MatchOrdersResponse:
         m = self._matches[match_id]
-        side = m.side_for_token(req.player_token)
-        if side is None:
-            raise KeyError("invalid token")
         with m.lock:
-            # store raw orders for now
-            if side == "A":
-                m.side_a.orders = req.player_orders
-            else:
-                m.side_b.orders = req.player_orders
+            msgs:list[str] = m.set_orders(req.player_token, req.player_orders)
+            if msgs:
+                _dbg(f"Order validation failed: {msgs}")
+                return MatchOrdersResponse(accepted=False, status=m.status, turn=m.map.turn, logs=msgs)
+
             # Resolve turn only when both sides submitted (ready)
             if m.status == "active" and (m.side_a.orders is not None and m.side_b.orders is not None):
                 try:

@@ -14,6 +14,7 @@ CARRIER_MAX_HP = 100
 VISION_SQUADRON = 5
 VISION_CARRIER = 4
 SQUADRON_RANGE = 22
+CARRIER_RANGE = 99999
 
 class Position(BaseModel,frozen=True):
 
@@ -137,6 +138,7 @@ class UnitState(BaseModel):
     hp: int
     max_hp: int
     speed: int
+    fuel: int
     vision: int
     target: Optional[Position] = None
 
@@ -181,6 +183,7 @@ class CarrierState(UnitState):
     hp: int = CARRIER_MAX_HP
     max_hp: int = CARRIER_MAX_HP
     speed: int = 2
+    fuel: int = CARRIER_RANGE
     vision: int = VISION_CARRIER
     hangar: int = 2
 
@@ -190,6 +193,7 @@ class SquadronState(UnitState):
     hp: int = SQUAD_MAX_HP
     max_hp: int = SQUAD_MAX_HP
     speed: int = 4
+    fuel: int = SQUADRON_RANGE
     vision: int = VISION_SQUADRON
     state: Literal["base", "outbound", "engaging", "returning", "lost"] = "base"
 
@@ -416,16 +420,8 @@ class MatchJoinResponse(BaseModel):
 
 class MatchStateResponse(BaseModel):
     match_id: str
-    status: MatchStatus
-    mode: MatchMode
     turn: int
-    your_side: Optional[Literal["A", "B"]] = None
-    waiting_for: Literal["none", "you", "opponent"] = "none"
-    # Optional minimal board + units snapshot for polling UI
-    map_w: Optional[int] = None
-    map_h: Optional[int] = None
-    a: Optional[Dict[str, Any]] = None  # expects {"carrier": {"x","y","hp"}}
-    b: Optional[Dict[str, Any]] = None
+    status: MatchStatus
 
 
 class MatchOrdersRequest(BaseModel):
@@ -435,9 +431,10 @@ class MatchOrdersRequest(BaseModel):
 
 
 class MatchOrdersResponse(BaseModel):
-    accepted: bool = True
-    status: MatchStatus
     turn: int
+    accepted: bool
+    status: MatchStatus
+    logs: List[str] = []
 
 class IntelPath(BaseModel):
     """索敵結果"""

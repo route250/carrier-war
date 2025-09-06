@@ -47,6 +47,9 @@ class UnitHolder:
                 'id': self.unit.id,
                 'hp': self.unit.hp,
                 'max_hp': self.unit.max_hp,
+                'vision': self.unit.vision,
+                'speed': self.unit.speed,
+                'fuel': self.unit.fuel,
             }
             if isinstance(self.unit, SquadronState):
                 result.update({
@@ -67,9 +70,9 @@ class UnitHolder:
                     })
             return result
         elif self.intel:
-            poist_list = [p for t,p in sorted(self.intel.items())]
-            first_seen = poist_list[0]
-            last_seen = poist_list[-1]
+            pos_list = [p for t,p in sorted(self.intel.items())]
+            first_seen = pos_list[0]
+            last_seen = pos_list[-1]
             result = {
                 'id': self.unit.id,
                 'hp': self.unit.hp,
@@ -122,6 +125,8 @@ class GameBord:
             raise ValueError("Map cannot be None.")
 
         self.turn:int = 1
+        self.max_turn:int = 30
+        self.result:str|None = None
         self.hexmap = hexmap
         self.units_list:list[UnitHolder] = []
         self.log_id: str | None = log_id
@@ -178,6 +183,34 @@ class GameBord:
     def get_map_array(self) -> list[list[int]]:
         return self.hexmap.copy_as_list()
 
+    def validate_orders(self, side:str, orders: PlayerOrders|None) -> list[str]:
+        msgs: list[str] = []
+        if orders is None:
+            return []
+        carrier = next((u for u in self.units_list if u.side == side and isinstance(u.unit, CarrierState)), None)
+        squadron = next((u for u in self.units_list if u.side == side and isinstance(u.unit, SquadronState) and u.unit.state == 'base'), None)
+
+        if orders.carrier_target is not None:
+            if carrier is None or not carrier.unit.is_active():
+                msgs.append("Carrier not found or sunk.")
+                return msgs
+            if not (0 <= orders.carrier_target.x < self.hexmap.W and 0 <= orders.carrier_target.y < self.hexmap.H):
+                msgs.append(f"Carrier target {orders.carrier_target} out of map bounds.")
+            elif self.hexmap.get(orders.carrier_target.x, orders.carrier_target.y) != 0:
+                msgs.append(f"Carrier target {orders.carrier_target} is not on sea.")
+
+        if orders.launch_target is not None:
+            if squadron is None or carrier is None or not carrier.unit.is_active():
+                msgs.append("No available squadron to launch.")
+                return msgs
+            if not (0 <= orders.launch_target.x < self.hexmap.W and 0 <= orders.launch_target.y < self.hexmap.H):
+                msgs.append(f"Launch target {orders.launch_target} out of map bounds.")
+            elif self.hexmap.get(orders.launch_target.x, orders.launch_target.y) != 0:
+                msgs.append(f"Launch target {orders.launch_target} is not on sea.")
+            elif carrier.unit.pos.hex_distance(orders.launch_target) > squadron.unit.fuel:
+                msgs.append(f"Launch target {orders.launch_target} is out of squadron range.")
+        return msgs
+
     def to_payload(self, view_side:str|None=None) -> tuple[dict,dict]:
         side = view_side if view_side in ['A','B'] else 'A'
         my_carrier = None
@@ -227,17 +260,26 @@ class GameBord:
             other_result['turn_visible'] = [ f"{p.x},{p.y}" for p in vlist ]
         return my_result, other_result
 
-    def _get_carrier_by_side(self, side: str) -> UnitHolder|None:
+    def _get_carrier_by_side(self, side: str) -> tuple[int,int]:
+        c = 0
+        s = 0
         for u in self.units_list:
-            if u.side == side and isinstance(u.unit, CarrierState):
-                return u
-        return None
+            if u.side == side:
+                if isinstance(u.unit, CarrierState):
+                    c += u.unit.hp if u.unit.hp is not None else 0
+                elif isinstance(u.unit, SquadronState):
+                    s += u.unit.hp if u.unit.hp is not None else 0
+        return c,s
 
     def get_carrier_by_side(self, side: str) -> CarrierState|None:
         for u in self.units_list:
-            if u.side == side and isinstance(u.unit, CarrierState):
-                return u.unit
+            if u.side == side:
+                if isinstance(u.unit, CarrierState):
+                    return u.unit
         return None
+
+    def get_result(self) -> str|None:
+        return self.result
 
     def get_squadrons_by_side(self, side: str) -> list[SquadronState]:
         return [u.unit for u in self.units_list if u.side == side and isinstance(u.unit, SquadronState)]
@@ -485,10 +527,29 @@ class GameBord:
             "a": {"pos": ([a_car.pos.x, a_car.pos.y] if a_car else None), "hp": (a_car.hp if a_car else None)},
             "b": {"pos": ([b_car.pos.x, b_car.pos.y] if b_car else None), "hp": (b_car.hp if b_car else None)},
         })
+
+        # 終了判定
+        a_carrier, a_squadrons = self._get_carrier_by_side("A")
+        b_carrier, b_squadrons = self._get_carrier_by_side("B")
+        if a_carrier <= 0 and b_carrier <= 0:
+            self.result = "draw"
+        elif b_carrier <= 0:
+            self.result = "A"
+        elif a_carrier <= 0:
+            self.result = "B"
+        elif a_squadrons > 0 and b_squadrons <= 0:
+            self.result = "A"
+        elif b_squadrons > 0 and a_squadrons <= 0:
+            self.result = "B"
+        elif self.turn > self.max_turn:
+            if a_carrier > b_carrier:
+                self.result = "A"
+            elif b_carrier > a_carrier:
+                self.result = "B"
+            else:
+                self.result = "draw"
         self.turn += 1
         return self.intel
 
     def is_over(self) -> bool:
-        a_hp = next( (u.unit.hp for u in self.units_list if u.side == "A" and isinstance(u.unit, CarrierState)), 0)
-        b_hp = next( (u.unit.hp for u in self.units_list if u.side == "B" and isinstance(u.unit, CarrierState)), 0)
-        return a_hp <= 0 or b_hp <= 0
+        return self.result is not None

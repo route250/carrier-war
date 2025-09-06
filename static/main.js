@@ -14,7 +14,7 @@ const SQUADRON_RANGE = 22;    // 航空機の航続距離（空母からの最�
 // === State ===
 const SQUAD_MAX_HP = 40;
 const CARRIER_MAX_HP = 100;
-const APP = { view: 'entrance', username: '', opponent: 'AI', difficulty: 'easy', lobbyMode: 'pve', match: null, matchSSE: null, matchHex: null, matchPending: { carrier_target: null, launch_target: null }, matchLoggedUpToTurn: 0 };
+const APP = { view: 'entrance', username: '', opponent: 'AI', difficulty: 'easy', lobbyMode: 'pve', match: null, matchSSE: null, matchHex: null, matchPending: { carrier_target: null, launch_target: null }, matchLoggedUpToTurn: 0, matchHover: null, gameHex: null };
 let GAME_INITIALIZED = false;
 const state = {
   map: [], // 0=sea, 1=island
@@ -147,6 +147,9 @@ function initApp() {
   el.btnLeaveMatch?.addEventListener('click', leaveMatchToLobby);
   el.btnSubmitReady?.addEventListener('click', submitReady);
   el.matchCanvas?.addEventListener('click', onMatchCanvasClick);
+  // PvP hover highlight
+  el.matchCanvas?.addEventListener('mousemove', onMatchCanvasMove);
+  el.matchCanvas?.addEventListener('mouseleave', onMatchCanvasLeave);
   // Match modes
   el.btnMatchModeMove?.addEventListener('click', () => setMatchMode('move'));
   el.btnMatchModeLaunch?.addEventListener('click', () => setMatchMode('launch'));
@@ -297,18 +300,6 @@ function leaveMatchToLobby() {
   try { startLobbySSE(); } catch {}
 }
 
-async function updateMatchState() {
-  if (!APP.match) return;
-  try {
-    const res = await fetch(`/v1/match/${APP.match.id}/state?token=${encodeURIComponent(APP.match.token)}`);
-    if (!res.ok) throw new Error(`status ${res.status}`);
-    const st = await res.json();
-    if (st) { handleMatchStateUpdate(st); }
-  } catch (e) {
-    if (el.matchInfo) el.matchInfo.textContent = '状態取得に失敗しました';
-  }
-}
-
 async function submitReady() {
   if (!APP.match) return;
   // allow submit whenever match is active; server will resolve when both are present
@@ -324,7 +315,18 @@ async function submitReady() {
     const res = await fetch(`/v1/match/${APP.match.id}/orders`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ player_token: APP.match.token, player_orders: staged }) });
     if (!res.ok) throw new Error(`status ${res.status}`);
     const js = await res.json();
-    // keep staged orders to allow resubmission/edit until解決（必要に応じて上書き可能）
+    // バリデーション失敗時はサーバのlogsをUIへ表示し、保留オーダは維持
+    if (js && js.accepted === false) {
+      try {
+        if (Array.isArray(js.logs)) {
+          for (const m of js.logs) matchLogMsg(`[NG] ${m}`);
+        } else {
+          matchLogMsg('[NG] 注文が受理されませんでした');
+        }
+      } catch {}
+      return;
+    }
+    // keep staged orders to allow resubmission/edit until resolve（必要に応じて上書き可能）
   } catch (e) {
     alert('送信に失敗しました');
   }
@@ -385,12 +387,12 @@ function renderMatchView() {
     APP.matchHex = makeHexRenderer(cv, W, H, getTile);
   }
   else { APP.matchHex.getTileFn = getTile; }
-  const a = st.a && st.a.carrier || {}; const b = st.b && st.b.carrier || {};
+  const me = (st && st.units && st.units.carrier) || {};
+  const op = (st && st.intel && st.intel.carrier) || {};
   APP.matchHex.renderBackground();
   // Visibility overlay (PvP): server-provided per-side turn_visible under a/b
   try {
-    const mySide = (APP.match && APP.match.side) || 'A';
-    const mineObj = (mySide === 'A') ? st.a : st.b;
+    const mineObj = st && st.units;
     const visList = (mineObj && Array.isArray(mineObj.turn_visible)) ? mineObj.turn_visible : [];
     // Normalize to Set("x,y") accepting both "x,y" and "x=..,y=.." formats
     const visSet = new Set();
@@ -409,28 +411,24 @@ function renderMatchView() {
     }
   } catch {}
   const mySide = (APP.match && APP.match.side) || 'A';
-  if (mySide === 'A') {
-    APP.matchHex.drawCarrier(a.x, a.y, getCss('--carrier')||'#4aa3ff', a.hp, 100);
-    APP.matchHex.drawCarrier(b.x, b.y, getCss('--enemy')||'#ff6464', b.hp, 100);
-  } else {
-    APP.matchHex.drawCarrier(b.x, b.y, getCss('--carrier')||'#4aa3ff', b.hp, 100);
-    APP.matchHex.drawCarrier(a.x, a.y, getCss('--enemy')||'#ff6464', a.hp, 100);
-  }
+  // 自分と相手を固定色で描画（side依存なし）
+  APP.matchHex.drawCarrier(me.x, me.y, getCss('--carrier')||'#4aa3ff', me.hp, 100);
+  APP.matchHex.drawCarrier(op.x, op.y, getCss('--enemy')||'#ff6464', op.hp, 100);
   // pending move preview line
-  const mine = (mySide === 'A') ? a : b;
+  const mine = me;
   const pending = APP.matchPending?.carrier_target;
   const srvTarget = mine && mine.target;
   if (mine && mine.x!=null && mine.y!=null) {
-    if (pending && pending.x!=null && pending.y!=null) {
+    if (pending && pending.x!=null && pending.y!=null && (pending.x !== mine.x || pending.y !== mine.y)) {
       // クライアント側の保留オーダーがあればそれを優先表示
       APP.matchHex.drawLine(mine.x, mine.y, pending.x, pending.y, 'rgba(106,212,255,0.5)');
-    } else if (srvTarget && srvTarget.x!=null && srvTarget.y!=null) {
+    } else if (srvTarget && srvTarget.x!=null && srvTarget.y!=null && (srvTarget.x !== mine.x || srvTarget.y !== mine.y)) {
       // 保留が無ければサーバ提供のtargetで進路表示
       APP.matchHex.drawLine(mine.x, mine.y, srvTarget.x, srvTarget.y, 'rgba(106,212,255,0.35)');
     }
   }
   // draw my squadrons (own side only)
-  const mySqs = (mySide === 'A') ? (st.a && st.a.squadrons) : (st.b && st.b.squadrons);
+  const mySqs = st.units && st.units.squadrons;
   if (Array.isArray(mySqs)) {
     for (const s of mySqs) {
       if (!s || s.state === 'base' || s.state === 'lost') continue;
@@ -443,7 +441,7 @@ function renderMatchView() {
     }
   }
   // draw enemy squadrons (visible/intel this turn): 赤＋菱形
-  const oppSqs = (mySide === 'A') ? (st.b && st.b.squadrons) : (st.a && st.a.squadrons);
+  const oppSqs = st.intel && st.intel.squadrons;
   if (Array.isArray(oppSqs)) {
     for (const s of oppSqs) {
       // 相手側は to_payload() 由来で今ターン発見したもののみ x,y を持つ
@@ -468,6 +466,8 @@ function renderMatchView() {
   if (pendingLaunch && mine && mine.x!=null && mine.y!=null) {
     APP.matchHex.drawLine(mine.x, mine.y, pendingLaunch.x, pendingLaunch.y, 'rgba(242,193,78,0.5)');
   }
+  // hover highlight（共通化）
+  try { APP.matchHex.renderHoverOutline({ mode: MATCH_MODE, hover: APP.matchHover, carrier: mine, squadrons: st.units?.squadrons }); } catch {}
 }
 
 // Enable/disable controls based on match status and readiness
@@ -476,13 +476,18 @@ function updateMatchControls() {
   const status = s.status;
   const wait = s.waiting_for;
   const disableAll = !APP.match || !s || status !== 'active';
-  // enable editing and submit only on your turn
-  // Submitは自分のターン（waiting_for==='you'）の時のみ有効
-  const canSubmit = !disableAll && (wait === 'you');
-  const canEdit = !disableAll && (wait === 'you');
+  // 編集/送信は「あなたの番」または「双方未提出（orders）」で可能
+  const canSubmit = !disableAll && (wait === 'you' || wait === 'orders');
+  const canEdit = !disableAll && (wait === 'you' || wait === 'orders');
   if (el.btnMatchModeMove) el.btnMatchModeMove.disabled = disableAll || !canEdit;
   if (el.btnMatchModeLaunch) el.btnMatchModeLaunch.disabled = disableAll || !canEdit;
   if (el.btnSubmitReady) el.btnSubmitReady.disabled = disableAll || !canSubmit;
+
+  // 強調表示（activeクラス）は編集可能な時のみ付与、待機中や受付中は外す
+  try {
+    if (el.btnMatchModeMove) el.btnMatchModeMove.classList.toggle('active', !disableAll && canEdit && MATCH_MODE === 'move');
+    if (el.btnMatchModeLaunch) el.btnMatchModeLaunch.classList.toggle('active', !disableAll && canEdit && MATCH_MODE === 'launch');
+  } catch {}
 }
 
 function onMatchCanvasClick(ev) {
@@ -491,7 +496,7 @@ function onMatchCanvasClick(ev) {
   // respect editability
   const s = APP.matchState || {};
   const status = s.status;
-  const canEdit = (status === 'active') && (s.waiting_for === 'you');
+  const canEdit = (status === 'active') && (s && (s.waiting_for === 'you' || s.waiting_for === 'orders'));
   const t = APP.matchHex.tileFromEvent(ev);
   if (!t) return;
   if (MATCH_MODE === 'move') {
@@ -505,6 +510,18 @@ function onMatchCanvasClick(ev) {
   }
   // Update topbar summary: show side, match status and waiting info
   // topbar update moved to updateMatchPanels
+}
+
+function onMatchCanvasMove(ev) {
+  if (!APP.match || !APP.matchHex) return;
+  const t = APP.matchHex.tileFromEvent(ev);
+  APP.matchHover = t;
+  renderMatchView();
+}
+
+function onMatchCanvasLeave() {
+  APP.matchHover = null;
+  renderMatchView();
 }
 
 async function submitOrders(orders) {
@@ -523,7 +540,23 @@ function setMatchMode(m) {
   MATCH_MODE = m;
   if (el.btnMatchModeMove) el.btnMatchModeMove.classList.toggle('active', m === 'move');
   if (el.btnMatchModeLaunch) el.btnMatchModeLaunch.classList.toggle('active', m === 'launch');
-  if (el.matchHint) el.matchHint.textContent = (m === 'move') ? '目的地をクリック（毎ターン自動移動）' : '目標地点をクリック（航続距離は未実装）';
+  if (el.matchHint) {
+    try {
+      if (m === 'move') {
+        const spd = APP.matchState?.units?.carrier?.speed;
+        el.matchHint.textContent = (typeof spd === 'number')
+          ? `目的地をクリック（移動速度: ${spd}）`
+          : '目的地をクリック';
+      } else if (m === 'launch') {
+        const sqs = APP.matchState?.units?.squadrons || [];
+        const bases = Array.isArray(sqs) ? sqs.filter(x => x && x.state === 'base' && (x.hp ?? 0) > 0) : [];
+        const maxFuel = bases.length ? Math.max(...bases.map(x => (typeof x.fuel === 'number') ? x.fuel : 0)) : null;
+        el.matchHint.textContent = (maxFuel != null)
+          ? `目標地点をクリック（最大航続距離: ${maxFuel}。サーバ側で検証）`
+          : '目標地点をクリック（発艦可能な編隊がありません）';
+      }
+    } catch { el.matchHint.textContent = (m === 'move') ? '目的地をクリック' : '目標地点をクリック'; }
+  }
 }
 
 // 共通: マッチ状態の更新時にターン進行を検知して保留オーダーをクリア
@@ -552,11 +585,12 @@ function handleMatchStateUpdate(nextState) {
 function updateMatchPanels() {
   if (!APP.matchState || !el.matchCarrierStatus) return;
   const s = APP.matchState || {};
-  const a = s.a?.carrier || {}, b = s.b?.carrier || {};
+  const mineC = s.units?.carrier || {}, oppC = s.intel?.carrier || {};
   const mySide = (APP.match?.side === 'A') ? 'A' : 'B';
-  const mine = (mySide === 'A') ? a : b;
+  const mine = mineC;
+  const opp = oppC;
   // own squadrons for counts
-  const mySqs = (mySide === 'A') ? (s.a && s.a.squadrons) : (s.b && s.b.squadrons);
+  const mySqs = s.units && s.units.squadrons;
   const sqArr = Array.isArray(mySqs) ? mySqs : [];
   const baseAvail = sqArr.filter((x) => x && x.state === 'base' && (x.hp ?? 0) > 0);
   const totalSlots = sqArr.length; // hangar 相当
@@ -564,10 +598,15 @@ function updateMatchPanels() {
   const hpMax = CARRIER_MAX_HP;
   const onboard = `${baseAvail.length} / ${totalSlots || '-'}`;
   const hpLine = `${hpNow} / ${hpMax}`;
+  const spd = (typeof mine.speed === 'number') ? `${mine.speed}` : '-';
+  const maxFuel = baseAvail.length ? Math.max(...baseAvail.map((x) => x && typeof x.fuel === 'number' ? x.fuel : 0)) : null;
+  const fuelLine = (maxFuel != null) ? `${maxFuel}` : '-';
   el.matchCarrierStatus.innerHTML = `
     <div class="kv">
       <div>HP</div><div>${hpLine}</div>
+      <div>速度</div><div>${spd}</div>
       <div>航空部隊</div><div>${onboard}</div>
+      <div>出撃航続距離</div><div>${fuelLine}</div>
     </div>
   `;
 
@@ -585,9 +624,13 @@ function updateMatchPanels() {
         let name = String(sq.id || '');
         const m = name.match(/(SQ\d+)$/);
         if (m) name = m[1];
+        const spd = (typeof sq.speed === 'number') ? sq.speed : '-';
+        const fuel = (typeof sq.fuel === 'number') ? sq.fuel : '-';
         const line1 = `<div class="kv"><div class="mono">${name}</div><div>${hpNow} / ${hpMax}</div></div>`;
         const line2 = `<div class="kv"><div>状態</div><div>${st}</div></div>`;
-        return `${line1}${line2}`;
+        const line3 = `<div class="kv"><div>速度</div><div>${spd}</div></div>`;
+        const line4 = `<div class="kv"><div>燃料</div><div>${fuel}</div></div>`;
+        return `${line1}${line2}${line3}${line4}`;
       }).join('');
       el.matchSquadronList.innerHTML = `<div class="list">${rows}</div>`;
     }
@@ -597,10 +640,11 @@ function updateMatchPanels() {
     const side = APP.match?.side ? APP.match.side : '-';
     let phase = '-';
     if (s.status === 'waiting') {
-      phase = '参加受付中（相手の参加待ち）';
+      phase = '参加受付中';
     } else if (s.status === 'active') {
-      if (s.waiting_for === 'you') phase = 'オーダー受付中（あなたの入力待ち）';
-      else if (s.waiting_for === 'opponent') phase = '相手のオーダ完了まち';
+      if (s.waiting_for === 'orders') phase = 'オーダー受付中';
+      else if (s.waiting_for === 'you') phase = 'あなたのオーダ入力待ち';
+      else if (s.waiting_for === 'opponent') phase = '相手のオーダ完了待ち';
       else phase = 'ターン解決中';
     } else if (s.status === 'over') {
       let result = s.result || null;
@@ -637,15 +681,7 @@ function matchLogMsg(msg) {
   el.matchLog.scrollTop = el.matchLog.scrollHeight;
 }
 
-function drawHpBarRect(x, y, cell, hp, max, color) {
-  if (hp == null || max == null) return;
-  const ctx = el.matchCanvas.getContext('2d');
-  const w = Math.max(12, Math.floor(cell * 0.7)), h = 4;
-  const cx = Math.round(x + (cell - w) / 2), cy = Math.round(y + 2);
-  const ratio = Math.max(0, Math.min(1, hp / max));
-  ctx.fillStyle = 'rgba(0,0,0,0.6)'; ctx.fillRect(cx, cy, w, h);
-  ctx.fillStyle = color; ctx.fillRect(cx, cy, Math.round(w * ratio), h);
-}
+// 旧: drawHpBarRect は Hex レンダラ内のHP描画へ統合
 
 // === Shared hex renderer (for PvP, non-invasive to PvE) ===
 function makeHexRenderer(canvas, W, H, getTileFn) {
@@ -700,6 +736,7 @@ function makeHexRenderer(canvas, W, H, getTileFn) {
     }
   }
   function drawCarrier(x,y,color,hp,max){ if(x==null||y==null) return; const [cx0,cy0]=offsetToPixel(x,y); const cx=cx0-HEX, cy=cy0-HEX; ctx.strokeStyle='rgba(0,0,0,0.85)'; ctx.lineWidth=4; ctx.strokeRect(cx+3,cy+3,HEX*2-6,HEX*2-6); ctx.fillStyle=color; ctx.fillRect(cx+4,cy+4,HEX*2-8,HEX*2-8); ctx.strokeStyle='rgba(255,255,255,0.35)'; ctx.lineWidth=1.5; ctx.strokeRect(cx+4,cy+4,HEX*2-8,HEX*2-8); drawHp(cx0,cy0,hp,max,color==='red'?'#ff9a9a':'#6ad4ff'); }
+  function drawCarrierStyled(x,y,color,{memory=false}={}){ if(x==null||y==null) return; const [cx0,cy0]=offsetToPixel(x,y); const cx=cx0-HEX, cy=cy0-HEX; ctx.save(); if (memory) ctx.globalAlpha = 0.55; ctx.strokeStyle='rgba(0,0,0,0.85)'; ctx.lineWidth=4; ctx.strokeRect(cx+3,cy+3,HEX*2-6,HEX*2-6); ctx.fillStyle=color; ctx.fillRect(cx+4,cy+4,HEX*2-8,HEX*2-8); ctx.strokeStyle='rgba(255,255,255,0.35)'; ctx.lineWidth=1.5; if (memory) ctx.setLineDash([4,3]); ctx.strokeRect(cx+4,cy+4,HEX*2-8,HEX*2-8); ctx.restore(); }
   function drawSquadron(x,y,color,hp,max){ if(x==null||y==null) return; const [px,py]=offsetToPixel(x,y); const r=Math.max(4, Math.round(HEX*0.6));
     ctx.beginPath(); ctx.arc(px, py, r+2, 0, Math.PI*2); ctx.strokeStyle='rgba(0,0,0,0.85)'; ctx.lineWidth=4; ctx.stroke();
     ctx.beginPath(); ctx.arc(px, py, r, 0, Math.PI*2); ctx.fillStyle=color; ctx.fill();
@@ -717,8 +754,24 @@ function makeHexRenderer(canvas, W, H, getTileFn) {
     // border
     ctx.strokeStyle='rgba(255,255,255,0.35)'; ctx.lineWidth=1.5; ctx.stroke();
   }
+  function drawDiamondStyled(x,y,color,{memory=false}={}){ if(x==null||y==null) return; const [px,py]=offsetToPixel(x,y); const r=Math.max(4, Math.round(HEX*0.6)); const pts=[[px,py-r],[px+r,py],[px,py+r],[px-r,py]]; ctx.save(); if (memory) ctx.globalAlpha = 0.55; ctx.beginPath(); ctx.moveTo(pts[0][0], pts[0][1]); for (let i=1;i<pts.length;i++) ctx.lineTo(pts[i][0], pts[i][1]); ctx.closePath(); ctx.strokeStyle='rgba(0,0,0,0.85)'; ctx.lineWidth=4; ctx.stroke(); ctx.fillStyle=color; ctx.fill(); ctx.strokeStyle='rgba(255,255,255,0.35)'; ctx.lineWidth=1.5; if (memory) ctx.setLineDash([4,3]); ctx.stroke(); ctx.restore(); }
   function drawLine(x1,y1,x2,y2,color){ ctx.strokeStyle=color; ctx.lineWidth=2; ctx.beginPath(); const [sx,sy]=offsetToPixel(x1,y1); const [tx,ty]=offsetToPixel(x2,y2); ctx.moveTo(sx,sy); ctx.lineTo(tx,ty); ctx.stroke(); }
   function drawHp(px,py,hp,max,color){ if(hp==null||max==null) return; const w=HEX*1.6,h=4; const x=Math.round(px - w/2), y=Math.round(py - HEX + 3); const ratio=Math.max(0,Math.min(1,hp/max)); ctx.fillStyle='rgba(0,0,0,0.6)'; ctx.fillRect(x,y,w,h); ctx.fillStyle=color; ctx.fillRect(x,y,Math.round(w*ratio),h); }
+  function drawHexOutline(c, r, color, width=2, dash=null) {
+    if (c==null || r==null) return;
+    const [px, py] = offsetToPixel(c, r);
+    const poly = hexPolygon(px, py, HEX);
+    ctx.save();
+    if (Array.isArray(dash)) ctx.setLineDash(dash);
+    ctx.beginPath();
+    ctx.moveTo(poly[0][0], poly[0][1]);
+    for (let i = 1; i < poly.length; i++) ctx.lineTo(poly[i][0], poly[i][1]);
+    ctx.closePath();
+    ctx.strokeStyle = color;
+    ctx.lineWidth = width;
+    ctx.stroke();
+    ctx.restore();
+  }
   function tileFromEvent(e){ const rect=canvas.getBoundingClientRect(); const scaleX = canvas.width/rect.width, scaleY = canvas.height/rect.height; const mx=(e.clientX-rect.left)*scaleX, my=(e.clientY-rect.top)*scaleY; const [qf, rf] = pixelToAxial(mx,my); const { q, r } = axialRound(qf, rf); const off = axialToOffset(q,r); const c=off.col, rr=off.row; if (c<0||rr<0||c>=W||rr>=H) return null; return {x:c,y:rr}; }
   function pixelToAxial(px,py){ const x=(px-ORX)/HEX, y=(py-ORY)/HEX; const q=(Math.sqrt(3)/3)*x - (1/3)*y; const r=(2/3)*y; return [q,r]; }
   function axialToCube(q,r){ return { x:q, z:r, y:-q-r }; }
@@ -727,7 +780,57 @@ function makeHexRenderer(canvas, W, H, getTileFn) {
   function axialRound(q,r){ const cr=cubeRound(q, -q - r, r); const ar=cubeToAxial(cr.x, cr.y, cr.z); return { q: ar.q, r: ar.r }; }
   function axialToOffset(q,r){ const col = q + ((r - (r & 1)) >> 1); const row = r; return { col, row };
   }
-  return { canvas, W, H, renderBackground, renderVisibilityOverlay, drawCarrier, drawSquadron, drawDiamond, tileFromEvent, drawLine, getTileFn };
+  // Range outline (ring of distance=range around center)
+  function drawRangeOutline(cx, cy, range, color) {
+    const pts = [];
+    const [pcx, pcy] = offsetToPixel(cx, cy);
+    for (let y = 0; y < H; y++) {
+      for (let x = 0; x < W; x++) {
+        if (hexDistance({ x, y }, { x: cx, y: cy }) === range) {
+          const [px, py] = offsetToPixel(x, y);
+          const ang = Math.atan2(py - pcy, px - pcx);
+          pts.push({ px, py, ang });
+        }
+      }
+    }
+    if (pts.length < 6) return; // not enough to draw a ring
+    pts.sort((a, b) => a.ang - b.ang);
+    ctx.save();
+    ctx.strokeStyle = color;
+    ctx.lineWidth = 1.5;
+    ctx.setLineDash([6, 4]);
+    ctx.beginPath();
+    ctx.moveTo(pts[0].px, pts[0].py);
+    for (let i = 1; i < pts.length; i++) ctx.lineTo(pts[i].px, pts[i].py);
+    ctx.closePath();
+    ctx.stroke();
+    ctx.restore();
+  }
+
+  // Unified hover outline with validity coloring
+  function renderHoverOutline({ mode, hover, carrier, squadrons }) {
+    if (!hover || hover.x == null || hover.y == null) return;
+    const c = hover.x, r = hover.y;
+    let color = '#ffffff';
+    if (mode === 'launch') {
+      const arr = Array.isArray(squadrons) ? squadrons : [];
+      const bases = arr.filter(x => x && x.state === 'base' && (x.hp ?? 0) > 0);
+      const hasAny = bases.length > 0;
+      const maxFuel = hasAny ? Math.max(...bases.map(x => (typeof x.fuel === 'number') ? x.fuel : 0)) : 0;
+      const onSea = (getTileFn(c, r) === 0);
+      let outOfRange = true;
+      if (typeof carrier?.x === 'number' && typeof carrier?.y === 'number' && hasAny) {
+        const d = hexDistance({ x: c, y: r }, { x: carrier.x, y: carrier.y });
+        outOfRange = !(d <= maxFuel);
+      }
+      if (!onSea || !hasAny || outOfRange) color = '#ff5c5c';
+    } else if (mode === 'move') {
+      if (getTileFn(c, r) === 1) color = '#ff5c5c';
+    }
+    drawHexOutline(c, r, color, 2);
+  }
+
+  return { canvas, W, H, renderBackground, renderVisibilityOverlay, drawCarrier, drawCarrierStyled, drawSquadron, drawDiamond, drawDiamondStyled, tileFromEvent, drawLine, drawHexOutline, drawRangeOutline, renderHoverOutline, getTileFn };
 }
 
 function bindUI() {
@@ -773,78 +876,42 @@ function renderAll() {
 }
 
 function renderMap() {
-  const w = el.canvas.width, h = el.canvas.height;
-  ctx.clearRect(0, 0, w, h);
-
-  // background water
-  ctx.fillStyle = getCss('--water');
-  ctx.fillRect(0, 0, w, h);
-
-  // draw hex tiles (offset coords -> axial -> pixel)
-  for (let r = 0; r < MAP_H; r++) {
-    for (let c = 0; c < MAP_W; c++) {
-      const [px, py] = offsetToPixel(c, r);
-      const poly = hexPolygon(px, py, HEX_SIZE);
-      ctx.beginPath();
-      ctx.moveTo(poly[0][0], poly[0][1]);
-      for (let i = 1; i < poly.length; i++) ctx.lineTo(poly[i][0], poly[i][1]);
-      ctx.closePath();
-      ctx.fillStyle = state.map[r][c] === 1 ? getCss('--island') : getCss('--water');
-      ctx.fill();
-      ctx.strokeStyle = getCss('--grid');
-      ctx.lineWidth = 1;
-      ctx.stroke();
-      // 自軍視界（今ターン）：少し明るくオーバーレイ
-      if (isTurnVisible(c, r)) {
-        ctx.fillStyle = 'rgba(255,255,255,0.14)';
-        ctx.fill();
-      }
+  // 共通レンダラに完全移管
+  try {
+    if (!APP.gameHex || APP.gameHex.canvas !== el.canvas || APP.gameHex.W !== MAP_W || APP.gameHex.H !== MAP_H) {
+      APP.gameHex = makeHexRenderer(el.canvas, MAP_W, MAP_H, (x,y)=> state.map?.[y]?.[x] || 0);
+    } else {
+      APP.gameHex.getTileFn = (x,y)=> state.map?.[y]?.[x] || 0;
     }
-  }
-
-  // highlight hex
-  if (state.highlight) {
-    const { x: c, y: r } = state.highlight;
-    const [px, py] = offsetToPixel(c, r);
-    const poly = hexPolygon(px, py, HEX_SIZE);
-    ctx.beginPath();
-    ctx.moveTo(poly[0][0], poly[0][1]);
-    for (let i = 1; i < poly.length; i++) ctx.lineTo(poly[i][0], poly[i][1]);
-    ctx.closePath();
-    let color = '#ffffff';
-    if (state.mode === 'launch') {
-      const d = hexDistance({ x: c, y: r }, state.carrier);
-      if (d > SQUADRON_RANGE) color = '#ff5c5c';
+    APP.gameHex.renderBackground();
+    if (state.turnVisible && state.turnVisible.size > 0) {
+      APP.gameHex.renderVisibilityOverlay(state.turnVisible);
     }
-    ctx.strokeStyle = color;
-    ctx.lineWidth = 2;
-    ctx.stroke();
-  }
+    APP.gameHex.renderHoverOutline({ mode: state.mode, hover: state.highlight, carrier: state.carrier, squadrons: state.squadrons });
+  } catch {}
 }
 
 function renderUnits() {
+  if (!APP.gameHex) return;
   // carrier
-  drawRectTile(state.carrier.x, state.carrier.y, getCss('--carrier'));
-  drawHpBarTile(state.carrier.x, state.carrier.y, state.carrier.hp, CARRIER_MAX_HP, '#6ad4ff');
+  APP.gameHex.drawCarrier(state.carrier.x, state.carrier.y, getCss('--carrier') || '#4aa3ff', state.carrier.hp, CARRIER_MAX_HP);
   if (state.carrier.target) {
-    drawLineTile(state.carrier.x, state.carrier.y, state.carrier.target.x, state.carrier.target.y, 'rgba(106,212,255,0.35)');
+    APP.gameHex.drawLine(state.carrier.x, state.carrier.y, state.carrier.target.x, state.carrier.target.y, 'rgba(106,212,255,0.35)');
   }
 
-  // launch mode: dashed range outline removed (hover color indicates validity)
-  // pending launch preview: show planned strike line (from spawn or carrier to target)
+  // pending launch preview
   if (typeof PENDING_LAUNCH === 'object' && PENDING_LAUNCH && typeof PENDING_LAUNCH.x === 'number' && typeof PENDING_LAUNCH.y === 'number') {
     const t = { x: PENDING_LAUNCH.x, y: PENDING_LAUNCH.y };
-    let from = findFreeAdjacent(state.carrier.x, state.carrier.y, { preferAwayFrom: t }) || { x: state.carrier.x, y: state.carrier.y };
-    drawLineTile(from.x, from.y, t.x, t.y, 'rgba(242,193,78,0.5)');
+    const from = findFreeAdjacent(state.carrier.x, state.carrier.y, { preferAwayFrom: t }) || { x: state.carrier.x, y: state.carrier.y };
+    APP.gameHex.drawLine(from.x, from.y, t.x, t.y, 'rgba(242,193,78,0.5)');
   }
 
   // squadrons
   for (const sq of state.squadrons) {
     if (sq.state === 'base' || sq.state === 'lost') continue;
-    drawCircleTile(sq.x, sq.y, getCss('--squad'));
-    drawHpBarTile(sq.x, sq.y, sq.hp ?? SQUAD_MAX_HP, SQUAD_MAX_HP, '#f2c14e');
-    if (sq.state === 'outbound') {
-      drawLineTile(sq.x, sq.y, sq.target.x, sq.target.y, 'rgba(242,193,78,0.35)');
+    APP.gameHex.drawSquadron(sq.x, sq.y, getCss('--squad') || '#f2c14e', sq.hp ?? SQUAD_MAX_HP, SQUAD_MAX_HP);
+    if (sq.state === 'outbound' && sq.target && sq.target.x != null && sq.target.y != null) {
+      APP.gameHex.drawLine(sq.x, sq.y, sq.target.x, sq.target.y, 'rgba(242,193,78,0.35)');
     }
   }
 }
@@ -854,143 +921,23 @@ function renderEnemyIntel() {
   const c = state.enemy.carrier;
   const ic = state.intel.carrier;
   if (isVisibleToPlayer(c.x, c.y)) {
-    drawRectTile(c.x, c.y, getCss('--enemy'));
-    drawHpBarTile(c.x, c.y, c.hp, CARRIER_MAX_HP, '#ff9a9a');
+    if (APP.gameHex) APP.gameHex.drawCarrier(c.x, c.y, getCss('--enemy') || '#ff6464', c.hp, CARRIER_MAX_HP);
   } else if (ic.ttl > 0) {
-    drawRectTileStyled(ic.x, ic.y, getCss('--enemy'), { memory: true });
+    if (APP.gameHex && APP.gameHex.drawCarrierStyled) APP.gameHex.drawCarrierStyled(ic.x, ic.y, getCss('--enemy') || '#ff6464', { memory: true });
   }
 
   // 敵編隊（ひし形・赤）
   for (const es of state.enemy.squadrons) {
     const m = state.intel.squadrons.get(es.id);
     if (isVisibleToPlayer(es.x, es.y)) {
-      drawDiamondTile(es.x, es.y, getCss('--enemy'));
+      if (APP.gameHex) APP.gameHex.drawDiamond(es.x, es.y, getCss('--enemy') || '#ff6464');
     } else if (m && m.ttl > 0) {
-      drawDiamondTileStyled(m.x, m.y, getCss('--enemy'), { memory: true });
+      if (APP.gameHex && APP.gameHex.drawDiamondStyled) APP.gameHex.drawDiamondStyled(m.x, m.y, getCss('--enemy') || '#ff6464', { memory: true });
     }
   }
 }
 
-function drawRectTile(x, y, color) {
-  const [cx0, cy0] = offsetToPixel(x, y);
-  const cx = cx0 - HEX_SIZE, cy = cy0 - HEX_SIZE;
-  // halo
-  ctx.strokeStyle = 'rgba(0,0,0,0.85)';
-  ctx.lineWidth = 4;
-  ctx.strokeRect(cx + 3, cy + 3, HEX_SIZE * 2 - 6, HEX_SIZE * 2 - 6);
-  // fill
-  ctx.fillStyle = color;
-  ctx.fillRect(cx + 4, cy + 4, HEX_SIZE * 2 - 8, HEX_SIZE * 2 - 8);
-  // border
-  ctx.strokeStyle = 'rgba(255,255,255,0.35)';
-  ctx.lineWidth = 1.5;
-  ctx.strokeRect(cx + 4, cy + 4, HEX_SIZE * 2 - 8, HEX_SIZE * 2 - 8);
-}
-function drawCircleTile(x, y, color) {
-  const [px, py] = offsetToPixel(x, y); const r = HEX_SIZE * 0.6;
-  // halo
-  ctx.beginPath(); ctx.arc(px, py, r + 2, 0, Math.PI * 2);
-  ctx.strokeStyle = 'rgba(0,0,0,0.85)'; ctx.lineWidth = 4; ctx.stroke();
-  // fill
-  ctx.beginPath(); ctx.arc(px, py, r, 0, Math.PI * 2);
-  ctx.fillStyle = color; ctx.fill();
-  // border
-  ctx.strokeStyle = 'rgba(255,255,255,0.35)'; ctx.lineWidth = 1.5; ctx.stroke();
-}
-function drawDiamondTile(x, y, color) {
-  const [cx, cy] = offsetToPixel(x, y); const r = HEX_SIZE * 0.6;
-  const pts = [ [cx, cy - r], [cx + r, cy], [cx, cy + r], [cx - r, cy] ];
-  // halo
-  ctx.beginPath(); ctx.moveTo(...pts[0]); for (let i = 1; i < pts.length; i++) ctx.lineTo(...pts[i]); ctx.closePath();
-  ctx.strokeStyle = 'rgba(0,0,0,0.85)'; ctx.lineWidth = 4; ctx.stroke();
-  // fill
-  ctx.fillStyle = color; ctx.fill();
-  // border
-  ctx.strokeStyle = 'rgba(255,255,255,0.35)'; ctx.lineWidth = 1.5; ctx.stroke();
-}
-
-function drawRectTileStyled(x, y, color, { memory } = {}) {
-  const [c0x, c0y] = offsetToPixel(x, y);
-  const cx = c0x - HEX_SIZE, cy = c0y - HEX_SIZE;
-  ctx.save();
-  if (memory) ctx.globalAlpha = 0.55;
-  // halo
-  ctx.strokeStyle = 'rgba(0,0,0,0.85)'; ctx.lineWidth = 4;
-  ctx.strokeRect(cx + 3, cy + 3, HEX_SIZE * 2 - 6, HEX_SIZE * 2 - 6);
-  // fill
-  ctx.fillStyle = color; ctx.fillRect(cx + 4, cy + 4, HEX_SIZE * 2 - 8, HEX_SIZE * 2 - 8);
-  // border dashed for memory
-  ctx.strokeStyle = 'rgba(255,255,255,0.35)'; ctx.lineWidth = 1.5;
-  if (memory) ctx.setLineDash([4, 3]);
-  ctx.strokeRect(cx + 4, cy + 4, HEX_SIZE * 2 - 8, HEX_SIZE * 2 - 8);
-  ctx.restore();
-}
-
-function drawDiamondTileStyled(x, y, color, { memory } = {}) {
-  const [cx, cy] = offsetToPixel(x, y); const r = HEX_SIZE * 0.6;
-  const pts = [ [cx, cy - r], [cx + r, cy], [cx, cy + r], [cx - r, cy] ];
-  ctx.save();
-  if (memory) ctx.globalAlpha = 0.55;
-  // halo
-  ctx.beginPath(); ctx.moveTo(...pts[0]); for (let i = 1; i < pts.length; i++) ctx.lineTo(...pts[i]); ctx.closePath();
-  ctx.strokeStyle = 'rgba(0,0,0,0.85)'; ctx.lineWidth = 4; ctx.stroke();
-  // fill
-  ctx.fillStyle = color; ctx.fill();
-  // border dashed for memory
-  ctx.strokeStyle = 'rgba(255,255,255,0.35)'; ctx.lineWidth = 1.5; if (memory) ctx.setLineDash([4, 3]);
-  ctx.stroke();
-  ctx.restore();
-}
-
-function drawHpBarTile(x, y, hp, max, color) {
-  const [px, py] = offsetToPixel(x, y);
-  const w = HEX_SIZE * 1.6, h = 4;
-  const cx = Math.round(px - w / 2), cy = Math.round(py - HEX_SIZE + 3);
-  const ratio = Math.max(0, Math.min(1, hp / max));
-  // bg
-  ctx.fillStyle = 'rgba(0,0,0,0.6)';
-  ctx.fillRect(cx, cy, w, h);
-  // fg
-  ctx.fillStyle = color;
-  ctx.fillRect(cx, cy, Math.round(w * ratio), h);
-}
-function drawLineTile(x1, y1, x2, y2, color) {
-  ctx.strokeStyle = color;
-  ctx.lineWidth = 2;
-  ctx.beginPath();
-  const [sx, sy] = offsetToPixel(x1, y1);
-  const [tx, ty] = offsetToPixel(x2, y2);
-  ctx.moveTo(sx, sy);
-  ctx.lineTo(tx, ty);
-  ctx.stroke();
-}
-
-// 指定中心からhex距離=rangeのタイル中心を結んでアウトラインを描画
-function drawRangeOutline(cx, cy, range, color) {
-  const pts = [];
-  const [pcx, pcy] = offsetToPixel(cx, cy);
-  for (let y = 0; y < MAP_H; y++) {
-    for (let x = 0; x < MAP_W; x++) {
-      if (hexDistance({ x, y }, { x: cx, y: cy }) === range) {
-        const [px, py] = offsetToPixel(x, y);
-        const ang = Math.atan2(py - pcy, px - pcx);
-        pts.push({ px, py, ang });
-      }
-    }
-  }
-  if (pts.length < 6) return; // not enough to draw a ring
-  pts.sort((a, b) => a.ang - b.ang);
-  ctx.save();
-  ctx.strokeStyle = color;
-  ctx.lineWidth = 1.5;
-  ctx.setLineDash([6, 4]);
-  ctx.beginPath();
-  ctx.moveTo(pts[0].px, pts[0].py);
-  for (let i = 1; i < pts.length; i++) ctx.lineTo(pts[i].px, pts[i].py);
-  ctx.closePath();
-  ctx.stroke();
-  ctx.restore();
-}
+// 旧PvE描画関数は共通Hexレンダラへ統合済み
 
 // === Panels ===
 function updatePanels() {
@@ -1031,7 +978,7 @@ function countActiveEnemySquadrons() { return state.enemy.squadrons.filter((s)=>
 
 // === Interaction ===
 function onMouseMove(e) {
-  const t = tileFromEvent(e);
+  const t = (APP.gameHex && APP.gameHex.tileFromEvent) ? APP.gameHex.tileFromEvent(e) : tileFromEvent(e);
   if (!t) return;
   state.highlight = t;
   renderAll();
@@ -1039,7 +986,7 @@ function onMouseMove(e) {
 
 function onMapClick(e) {
   if (state.gameOver) return;
-  const t = tileFromEvent(e);
+  const t = (APP.gameHex && APP.gameHex.tileFromEvent) ? APP.gameHex.tileFromEvent(e) : tileFromEvent(e);
   if (!t) return;
 
   if (state.mode === 'move') {

@@ -115,14 +115,7 @@
         </div>
       </header>
       <main class="match-room">
-        <div class="room-actions">
-          <button id="btnSubmitReady">Done</button>
-          <span class="divider"></span>
-          <button class="mode-btn active" id="btnMatchModeMove" data-match-mode="move">空母</button>
-          <button class="mode-btn" id="btnMatchModeLaunch" data-match-mode="launch">航空部隊</button>
-          <span id="matchHint" class="hint"></span>
-          <span class="grow"></span>
-        </div>
+        
         <section class="match-layout">
           <div class="match-board">
             <canvas id="matchCanvas" width="540" height="540" aria-label="PvPマップ"></canvas>
@@ -135,13 +128,21 @@
           </div>
           <aside class="match-sidebar">
             <section>
-              <h2>空母</h2>
+              <div class="section-head">
+                <button class="mode-btn" id="btnMatchModeMove" data-match-mode="move">空母</button>
+              </div>
               <div id="matchCarrierStatus" class="panel"></div>
             </section>
             <section>
-              <h2>航空部隊</h2>
+              <div class="section-head">
+                <button class="mode-btn" id="btnMatchModeLaunch" data-match-mode="launch">航空部隊</button>
+              </div>
               <div id="matchSquadronList" class="panel"></div>
             </section>
+            <div class="sidebar-controls">
+              <span id="matchHint" class="hint"></span>
+              <button id="btnSubmitReady">Done</button>
+            </div>
           </aside>
         </section>
         <section>

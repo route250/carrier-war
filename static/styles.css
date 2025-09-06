@@ -61,6 +61,11 @@ body {
 #matchCanvas { width: 100%; height: auto; background: var(--water); border: 1px solid #22303c; }
 .match-layout { display: grid; grid-template-columns: 1fr 260px; gap: 8px; }
 .match-sidebar { background: var(--panel); border: 1px solid #27323c; border-radius: 8px; padding: 6px; }
+.match-sidebar .section-head { display: flex; align-items: center; justify-content: space-between; margin: 2px 0 4px; }
+.match-sidebar .mode-btn { font-size: 11px; padding: 2px 6px; line-height: 1.2; }
+.match-sidebar .mode-btn.active { outline: 2px solid var(--accent); }
+.match-sidebar .sidebar-controls { display: flex; align-items: center; gap: 8px; justify-content: flex-end; margin-top: 6px; }
+.match-sidebar .hint { display: block; font-size: 11px; color: var(--muted); margin: 2px 0 6px; }
 
 .topbar {
   display: flex;
@@ -85,6 +90,8 @@ button {
 }
 button:hover { border-color: #395064; }
 button.active { outline: 2px solid var(--accent); }
+button:disabled { opacity: 0.5; cursor: default; filter: grayscale(0.3); }
+.mode-btn:disabled { outline: none; }
 
 .layout {
   display: grid;
